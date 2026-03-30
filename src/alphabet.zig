@@ -60,6 +60,36 @@ pub const Alphabet = struct {
     pub fn unknownCode(self: *const Alphabet) u8 {
         return self.kp - 3;
     }
+
+    pub fn digitize(self: *const Alphabet, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        const dsq = try allocator.alloc(u8, text.len);
+        errdefer allocator.free(dsq);
+        for (text, 0..) |char, i| {
+            dsq[i] = self.encode(char) catch return error.InvalidCharacter;
+        }
+        return dsq;
+    }
+
+    pub fn textize(self: *const Alphabet, allocator: std.mem.Allocator, dsq: []const u8) ![]u8 {
+        const text = try allocator.alloc(u8, dsq.len);
+        for (dsq, 0..) |code, i| {
+            text[i] = self.decode(code);
+        }
+        return text;
+    }
+
+    pub fn reverseComplement(self: *const Alphabet, dsq: []u8) error{NoComplement}!void {
+        const comp = self.complement orelse return error.NoComplement;
+        var i: usize = 0;
+        var j: usize = dsq.len;
+        while (i < j) {
+            j -= 1;
+            const tmp = comp[dsq[i]];
+            dsq[i] = comp[dsq[j]];
+            dsq[j] = tmp;
+            i += 1;
+        }
+    }
 };
 
 // --- Task 3: Comptime DNA alphabet construction ---
@@ -402,4 +432,97 @@ test "Amino degeneracy codes" {
     try std.testing.expectEqual(@as(u8, 23), try amino.encode('Z'));
     try std.testing.expectEqual(@as(u8, 24), try amino.encode('O'));
     try std.testing.expectEqual(@as(u8, 25), try amino.encode('U'));
+}
+
+// --- Tests for Task 5: digitize, textize, reverseComplement ---
+
+test "digitize ACGT" {
+    const result = try dna.digitize(std.testing.allocator, "ACGT");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 2, 3 }, result);
+}
+
+test "digitize lowercase acgt" {
+    const result = try dna.digitize(std.testing.allocator, "acgt");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 2, 3 }, result);
+}
+
+test "digitize with degeneracies ACNR" {
+    const result = try dna.digitize(std.testing.allocator, "ACNR");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 15, 5 }, result);
+}
+
+test "digitize invalid character returns error" {
+    try std.testing.expectError(error.InvalidCharacter, dna.digitize(std.testing.allocator, "ACGZ"));
+}
+
+test "digitize empty string" {
+    const result = try dna.digitize(std.testing.allocator, "");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "textize round-trip DNA" {
+    const input = "ACGTRYNSWHBVD";
+    const dsq = try dna.digitize(std.testing.allocator, input);
+    defer std.testing.allocator.free(dsq);
+    const text = try dna.textize(std.testing.allocator, dsq);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualSlices(u8, input, text);
+}
+
+test "textize round-trip amino acid" {
+    const input = "ACDEFGHIKLMNPQRSTVWY";
+    const dsq = try amino.digitize(std.testing.allocator, input);
+    defer std.testing.allocator.free(dsq);
+    const text = try amino.textize(std.testing.allocator, dsq);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualSlices(u8, input, text);
+}
+
+test "reverseComplement palindrome ACGT" {
+    var seq = [_]u8{ 0, 1, 2, 3 }; // A, C, G, T
+    try dna.reverseComplement(&seq);
+    // reverse of [T,G,C,A] complement = [A,C,G,T] -> palindrome
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 2, 3 }, &seq);
+}
+
+test "reverseComplement AACG -> CGTT" {
+    var seq = [_]u8{ 0, 0, 1, 2 }; // A, A, C, G
+    try dna.reverseComplement(&seq);
+    // reverse of [G,C,A,A] complement = [C,G,T,T]
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 3 }, &seq);
+}
+
+test "reverseComplement odd length ACG -> CGT" {
+    var seq = [_]u8{ 0, 1, 2 }; // A, C, G
+    try dna.reverseComplement(&seq);
+    // reverse = [G,C,A], complement = [C,G,T]
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3 }, &seq);
+}
+
+test "reverseComplement single A -> T" {
+    var seq = [_]u8{0}; // A
+    try dna.reverseComplement(&seq);
+    try std.testing.expectEqualSlices(u8, &[_]u8{3}, &seq);
+}
+
+test "reverseComplement empty" {
+    var seq = [_]u8{};
+    try dna.reverseComplement(&seq);
+    try std.testing.expectEqual(@as(usize, 0), seq.len);
+}
+
+test "reverseComplement amino returns error" {
+    var seq = [_]u8{ 0, 1, 2 };
+    try std.testing.expectError(error.NoComplement, amino.reverseComplement(&seq));
+}
+
+test "reverseComplement degeneracies RY -> RY" {
+    // R=5, Y=6. reverse of [Y,R] complement = [R,Y] -> same
+    var seq = [_]u8{ 5, 6 }; // R, Y
+    try dna.reverseComplement(&seq);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 5, 6 }, &seq);
 }
