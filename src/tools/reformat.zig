@@ -50,7 +50,10 @@ pub fn main() !void {
     };
 
     // Guess alphabet from file content.
-    const abc_type = zeacel.alphabet.guessType(data) orelse .dna;
+    const abc_type = zeacel.alphabet.guessType(data) orelse blk: {
+        std.debug.print("Warning: could not detect alphabet, defaulting to DNA\n", .{});
+        break :blk .dna;
+    };
     const abc: *const zeacel.alphabet.Alphabet = switch (abc_type) {
         .dna => &zeacel.alphabet.dna,
         .rna => &zeacel.alphabet.rna,
@@ -69,6 +72,8 @@ pub fn main() !void {
 
     // Write sequences to stdout in the requested format.
     const stdout_file = std.fs.File.stdout();
+    // TODO(M1): deprecatedWriter() is deprecated; migrate to stdout_file.writer(buffer)
+    // once the codebase adopts the new std.Io.Writer API (requires an explicit buffer).
     const stdout = stdout_file.deprecatedWriter();
     var writer = zeacel.io.Writer.init(stdout.any(), out_format, 60);
     try writer.writeAll(sequences);

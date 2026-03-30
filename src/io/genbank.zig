@@ -55,6 +55,7 @@ pub fn parseOneGenBank(allocator: Allocator, abc: *const Alphabet, data: []const
     var in_origin = false;
     var seq_buf = std.ArrayList(u8){};
     defer seq_buf.deinit(allocator);
+    var found_terminator = false;
 
     while (pos.* < data.len) {
         // Read one line
@@ -74,6 +75,7 @@ pub fn parseOneGenBank(allocator: Allocator, abc: *const Alphabet, data: []const
 
         // Record terminator
         if (std.mem.eql(u8, line, "//")) {
+            found_terminator = true;
             break;
         }
 
@@ -133,6 +135,7 @@ pub fn parseOneGenBank(allocator: Allocator, abc: *const Alphabet, data: []const
     }
 
     if (name == null) return error.InvalidFormat;
+    if (!found_terminator) return error.InvalidFormat;
 
     const dsq = try abc.digitize(allocator, seq_buf.items);
     errdefer allocator.free(dsq);
@@ -209,6 +212,7 @@ pub fn parseOneEmbl(allocator: Allocator, abc: *const Alphabet, data: []const u8
     var accession: ?[]const u8 = null;
     var description: ?[]const u8 = null;
     var in_sequence = false;
+    var found_terminator = false;
 
     var seq_buf = std.ArrayList(u8){};
     defer seq_buf.deinit(allocator);
@@ -229,6 +233,7 @@ pub fn parseOneEmbl(allocator: Allocator, abc: *const Alphabet, data: []const u8
 
         // Record terminator
         if (std.mem.eql(u8, line, "//")) {
+            found_terminator = true;
             break;
         }
 
@@ -276,6 +281,7 @@ pub fn parseOneEmbl(allocator: Allocator, abc: *const Alphabet, data: []const u8
     }
 
     if (name == null) return error.InvalidFormat;
+    if (!found_terminator) return error.InvalidFormat;
 
     const dsq = try abc.digitize(allocator, seq_buf.items);
     errdefer allocator.free(dsq);
@@ -406,7 +412,8 @@ pub fn writeEmbl(dest: std.io.AnyWriter, seq: Sequence) !void {
         const residues_written = line_end - i;
         const chunks = (residues_written + 9) / 10;
         const chars_written = residues_written + (chunks - 1); // letters + spaces between chunks
-        const pad = 66 - 5 - chars_written; // 5 is the indent
+        const target_width = 66 - 5; // 61; 5 is the indent
+        const pad = if (chars_written < target_width) target_width - chars_written else 0;
         var p: usize = 0;
         while (p < pad) : (p += 1) {
             try dest.writeByte(' ');
