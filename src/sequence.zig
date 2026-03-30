@@ -103,6 +103,7 @@ pub const Sequence = struct {
                 .full_length = src.full_length,
             };
         }
+        errdefer if (source_copy) |src| self.allocator.free(src.name);
 
         return Sequence{
             .name = name_copy,

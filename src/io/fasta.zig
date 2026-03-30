@@ -45,7 +45,7 @@ pub fn parseAll(allocator: Allocator, abc: *const Alphabet, data: []const u8) ![
 
 /// Parse a single FASTA record starting at data[pos] (which must be '>').
 /// Updates pos to point past the parsed record (to the next '>' or EOF).
-fn parseOne(allocator: Allocator, abc: *const Alphabet, data: []const u8, pos: *usize) !Sequence {
+pub fn parseOne(allocator: Allocator, abc: *const Alphabet, data: []const u8, pos: *usize) !Sequence {
     // Consume '>'
     pos.* += 1;
 

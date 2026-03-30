@@ -93,7 +93,7 @@ pub const Reader = struct {
         if (self.pos >= self.data.len) return null;
         if (self.data[self.pos] != '>') return error.InvalidFormat;
 
-        return try parseFastaRecord(self.allocator, self.abc, self.data, &self.pos);
+        return try fasta.parseOne(self.allocator, self.abc, self.data, &self.pos);
     }
 
     /// Read all remaining sequences.
@@ -158,70 +158,6 @@ pub const Reader = struct {
         }
     }
 };
-
-/// Parse one FASTA record from data starting at pos (must point to '>').
-/// Advances pos past the record.
-fn parseFastaRecord(allocator: Allocator, abc: *const Alphabet, data: []const u8, pos: *usize) !Sequence {
-    // Consume '>'
-    pos.* += 1;
-
-    // Parse header line
-    const header_start = pos.*;
-    while (pos.* < data.len and data[pos.*] != '\n' and data[pos.*] != '\r') {
-        pos.* += 1;
-    }
-    const header = data[header_start..pos.*];
-
-    if (pos.* < data.len and data[pos.*] == '\r') pos.* += 1;
-    if (pos.* < data.len and data[pos.*] == '\n') pos.* += 1;
-
-    var name: []const u8 = header;
-    var description: ?[]const u8 = null;
-    for (header, 0..) |c, i| {
-        if (c == ' ' or c == '\t') {
-            name = header[0..i];
-            var ds = i + 1;
-            while (ds < header.len and (header[ds] == ' ' or header[ds] == '\t')) ds += 1;
-            if (ds < header.len) description = header[ds..];
-            break;
-        }
-    }
-
-    // Collect sequence characters
-    var seq_buf = std.ArrayList(u8){};
-    defer seq_buf.deinit(allocator);
-
-    while (pos.* < data.len and data[pos.*] != '>') {
-        const c = data[pos.*];
-        pos.* += 1;
-        if (c == '\n' or c == '\r' or c == ' ' or c == '\t') continue;
-        try seq_buf.append(allocator, c);
-    }
-
-    const dsq = try abc.digitize(allocator, seq_buf.items);
-    errdefer allocator.free(dsq);
-
-    const name_copy = try allocator.dupe(u8, name);
-    errdefer allocator.free(name_copy);
-
-    var desc_copy: ?[]const u8 = null;
-    if (description) |desc| {
-        desc_copy = try allocator.dupe(u8, desc);
-    }
-    errdefer if (desc_copy) |d| allocator.free(d);
-
-    return Sequence{
-        .name = name_copy,
-        .accession = null,
-        .description = desc_copy,
-        .taxonomy_id = null,
-        .dsq = dsq,
-        .secondary_structure = null,
-        .source = null,
-        .abc = abc,
-        .allocator = allocator,
-    };
-}
 
 // --- Tests ---
 

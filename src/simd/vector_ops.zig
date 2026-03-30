@@ -77,6 +77,9 @@ pub fn VectorOps(comptime T: type) type {
         // ----------------------------------------------------------------
 
         /// Sum all elements of v.
+        ///
+        /// Note: For small integer types (u8, i8), the result type is the same as the input type,
+        /// so overflow may occur for large slices. Use a wider type (e.g., VectorOps(u32)) for safe accumulation.
         pub fn sum(v: []const T) T {
             var acc: V = @splat(0);
             var i: usize = 0;

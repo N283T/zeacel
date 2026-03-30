@@ -26,6 +26,7 @@ pub const Alphabet = struct {
     }
 
     pub fn decode(self: *const Alphabet, code: u8) u8 {
+        std.debug.assert(code < self.symbols.len);
         return self.symbols[code];
     }
 
