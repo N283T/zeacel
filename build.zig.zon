@@ -1,0 +1,8 @@
+.{
+    .name = .zeacel,
+    .fingerprint = 0xdf2c20b78bec1340,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.0",
+    .dependencies = .{},
+    .paths = .{"."},
+}
