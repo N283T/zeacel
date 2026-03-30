@@ -38,7 +38,7 @@ pub const Alphabet = struct {
     }
 
     pub fn isDegenerate(self: *const Alphabet, code: u8) bool {
-        return code > self.k and code < self.kp - 2;
+        return code > self.k and code < self.kp - 3;
     }
 
     pub fn isUnknown(self: *const Alphabet, code: u8) bool {
@@ -140,6 +140,69 @@ pub const dna: Alphabet = .{
     .symbols = dna_symbols,
     .encode_map = buildEncodeMap(dna_symbols, dna_synonyms),
     .complement = &dna_complement_table,
+};
+
+// RNA symbol string. Same structure as DNA, U instead of T.
+//   0..3  : canonical residues A, C, G, U
+//   4     : gap (-)
+//   5..14 : degeneracy symbols R, Y, M, K, S, W, H, B, V, D
+//   15    : unknown (N)
+//   16    : nonresidue (*)
+//   17    : missing (~)
+pub const rna_symbols: []const u8 = "ACGU-RYMKSWHBVDN*~";
+
+// Complement table for RNA: A(0)<->U(3), C(1)<->G(2), same degeneracy pattern as DNA.
+pub const rna_complement_table: [18]u8 = .{
+    3, 2, 1, 0, // A->U, C->G, G->C, U->A
+    4, // gap->gap
+    6, 5, // R->Y, Y->R
+    8, 7, // M->K, K->M
+    9, 10, // S->S, W->W
+    14, 13, 12, 11, // H->D, B->V, V->B, D->H
+    15, 16, 17, // N->N, *->*, ~->~
+};
+
+// Synonym pairs for RNA: T->U, X->N, I->A, _->-, .->-
+const rna_synonyms: []const [2]u8 = &.{
+    .{ 'T', 'U' },
+    .{ 'X', 'N' },
+    .{ 'I', 'A' },
+    .{ '_', '-' },
+    .{ '.', '-' },
+};
+
+pub const rna: Alphabet = .{
+    .kind = .rna,
+    .k = 4,
+    .kp = 18,
+    .symbols = rna_symbols,
+    .encode_map = buildEncodeMap(rna_symbols, rna_synonyms),
+    .complement = &rna_complement_table,
+};
+
+// Amino acid symbol string. Positions:
+//   0..19 : canonical residues A, C, D, E, F, G, H, I, K, L, M, N, P, Q, R, S, T, V, W, Y
+//   20    : gap (-)
+//   21..25: degeneracy symbols B, J, Z, O, U
+//   26    : unknown (X)
+//   27    : nonresidue (*)
+//   28    : missing (~)
+pub const amino_symbols: []const u8 = "ACDEFGHIKLMNPQRSTVWY-BJZOUX*~";
+
+// No complement table for amino acids.
+// Synonym pairs: _->-, .->-
+const amino_synonyms: []const [2]u8 = &.{
+    .{ '_', '-' },
+    .{ '.', '-' },
+};
+
+pub const amino: Alphabet = .{
+    .kind = .amino,
+    .k = 20,
+    .kp = 29,
+    .symbols = amino_symbols,
+    .encode_map = buildEncodeMap(amino_symbols, amino_synonyms),
+    .complement = null,
 };
 
 // --- Tests for Task 2 ---
@@ -277,4 +340,66 @@ test "DNA complement table" {
     // R(5) <-> Y(6)
     try std.testing.expectEqual(@as(u8, 6), dna_complement_table[5]);
     try std.testing.expectEqual(@as(u8, 5), dna_complement_table[6]);
+}
+
+// --- Tests for Task 4: RNA and Amino Acid Alphabets ---
+
+test "RNA encode canonical residues" {
+    try std.testing.expectEqual(@as(u8, 0), try rna.encode('A'));
+    try std.testing.expectEqual(@as(u8, 3), try rna.encode('U'));
+}
+
+test "RNA encode synonym T->U" {
+    try std.testing.expectEqual(@as(u8, 3), try rna.encode('T'));
+    try std.testing.expectEqual(@as(u8, 3), try rna.encode('t'));
+}
+
+test "RNA encode case-insensitive" {
+    try std.testing.expectEqual(@as(u8, 0), try rna.encode('a'));
+}
+
+test "RNA complement" {
+    const comp = rna.complement.?;
+    // A(0) <-> U(3)
+    try std.testing.expectEqual(@as(u8, 3), comp[0]);
+    try std.testing.expectEqual(@as(u8, 0), comp[3]);
+}
+
+test "Amino encode canonical residues" {
+    try std.testing.expectEqual(@as(u8, 0), try amino.encode('A'));
+    try std.testing.expectEqual(@as(u8, 19), try amino.encode('Y'));
+}
+
+test "Amino encode case-insensitive" {
+    try std.testing.expectEqual(@as(u8, 0), try amino.encode('a'));
+}
+
+test "Amino gap codes" {
+    try std.testing.expectEqual(@as(u8, 20), try amino.encode('-'));
+    try std.testing.expectEqual(@as(u8, 20), try amino.encode('_'));
+    try std.testing.expectEqual(@as(u8, 20), try amino.encode('.'));
+}
+
+test "Amino sizes" {
+    try std.testing.expectEqual(@as(u8, 20), amino.k);
+    try std.testing.expectEqual(@as(u8, 29), amino.kp);
+}
+
+test "Amino unknown X at kp-3" {
+    const x_code = amino.kp - 3; // 29 - 3 = 26
+    try std.testing.expectEqual(@as(u8, 26), try amino.encode('X'));
+    try std.testing.expectEqual(@as(u8, 'X'), amino.decode(26));
+    try std.testing.expectEqual(x_code, try amino.encode('X'));
+}
+
+test "Amino no complement" {
+    try std.testing.expectEqual(@as(?[]const u8, null), amino.complement);
+}
+
+test "Amino degeneracy codes" {
+    try std.testing.expectEqual(@as(u8, 21), try amino.encode('B'));
+    try std.testing.expectEqual(@as(u8, 22), try amino.encode('J'));
+    try std.testing.expectEqual(@as(u8, 23), try amino.encode('Z'));
+    try std.testing.expectEqual(@as(u8, 24), try amino.encode('O'));
+    try std.testing.expectEqual(@as(u8, 25), try amino.encode('U'));
 }
