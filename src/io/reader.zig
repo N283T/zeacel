@@ -6,10 +6,13 @@ const Alphabet = @import("../alphabet.zig").Alphabet;
 const Sequence = @import("../sequence.zig").Sequence;
 const fasta = @import("fasta.zig");
 const stockholm = @import("stockholm.zig");
+const genbank = @import("genbank.zig");
 
 pub const Format = enum {
     fasta,
     stockholm,
+    genbank,
+    embl,
 
     /// Detect format from the first non-whitespace bytes of data.
     pub fn detect(header: []const u8) ?Format {
@@ -17,10 +20,13 @@ pub const Format = enum {
         while (i < header.len and (header[i] == ' ' or header[i] == '\t' or header[i] == '\n' or header[i] == '\r')) {
             i += 1;
         }
-        if (i < header.len and header[i] == '>') return .fasta;
-        // Detect Stockholm: first non-blank line starts with "# STOCKHOLM"
+        if (i >= header.len) return null;
+        if (header[i] == '>') return .fasta;
         const rest = header[i..];
         if (std.mem.startsWith(u8, rest, "# STOCKHOLM")) return .stockholm;
+        if (std.mem.startsWith(u8, rest, "LOCUS")) return .genbank;
+        // EMBL/UniProt: two-letter tag "ID" followed by exactly 3 spaces
+        if (std.mem.startsWith(u8, rest, "ID   ")) return .embl;
         return null;
     }
 };
@@ -35,6 +41,9 @@ pub const Reader = struct {
     // Stockholm buffering: sequences are extracted from the MSA on first call.
     stk_seqs: ?[]Sequence = null,
     stk_idx: usize = 0,
+    // GenBank/EMBL buffering: all records parsed on first call, then iterated.
+    gb_seqs: ?[]Sequence = null,
+    gb_idx: usize = 0,
 
     /// Open a file and create a reader (reads entire file into memory).
     /// If format is null, the format is auto-detected from the file header.
@@ -77,6 +86,8 @@ pub const Reader = struct {
         switch (self.format) {
             .fasta => return try nextFasta(self),
             .stockholm => return try nextStockholm(self),
+            .genbank => return try nextGenBank(self),
+            .embl => return try nextEmbl(self),
         }
     }
 
@@ -111,6 +122,34 @@ pub const Reader = struct {
         }
 
         return list.toOwnedSlice(self.allocator);
+    }
+
+    fn nextGenBank(self: *Reader) !?Sequence {
+        if (self.gb_seqs == null) {
+            const seqs = try genbank.parseAllGenBank(self.allocator, self.abc, self.data);
+            self.gb_seqs = seqs;
+            self.gb_idx = 0;
+            self.pos = self.data.len;
+        }
+        const seqs = self.gb_seqs.?;
+        if (self.gb_idx >= seqs.len) return null;
+        const seq = seqs[self.gb_idx];
+        self.gb_idx += 1;
+        return seq;
+    }
+
+    fn nextEmbl(self: *Reader) !?Sequence {
+        if (self.gb_seqs == null) {
+            const seqs = try genbank.parseAllEmbl(self.allocator, self.abc, self.data);
+            self.gb_seqs = seqs;
+            self.gb_idx = 0;
+            self.pos = self.data.len;
+        }
+        const seqs = self.gb_seqs.?;
+        if (self.gb_idx >= seqs.len) return null;
+        const seq = seqs[self.gb_idx];
+        self.gb_idx += 1;
+        return seq;
     }
 
     fn nextStockholm(self: *Reader) !?Sequence {
@@ -151,6 +190,10 @@ pub const Reader = struct {
             // Sequences already returned to caller are not freed here;
             // we only free any that were never consumed.
             for (seqs[self.stk_idx..]) |*s| @constCast(s).deinit();
+            self.allocator.free(seqs);
+        }
+        if (self.gb_seqs) |seqs| {
+            for (seqs[self.gb_idx..]) |*s| @constCast(s).deinit();
             self.allocator.free(seqs);
         }
         if (self.owns_data) {
@@ -281,4 +324,75 @@ test "Reader.readAll: second call on exhausted reader returns empty" {
     const more = try reader.readAll();
     defer allocator.free(more);
     try std.testing.expectEqual(@as(usize, 0), more.len);
+}
+
+test "Format.detect: genbank" {
+    try std.testing.expectEqual(@as(?Format, .genbank), Format.detect("LOCUS       SEQ1\n"));
+}
+
+test "Format.detect: embl" {
+    try std.testing.expectEqual(@as(?Format, .embl), Format.detect("ID   X56734; SV 1;\n"));
+}
+
+test "Reader.next: genbank auto-detect and iterate" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\LOCUS       SEQ1
+        \\ORIGIN
+        \\        1 acgt
+        \\//
+        \\LOCUS       SEQ2
+        \\ORIGIN
+        \\        1 gggg
+        \\//
+        \\
+    ;
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, null);
+    defer reader.deinit();
+
+    try std.testing.expectEqual(Format.genbank, reader.format);
+
+    var seq1 = (try reader.next()) orelse return error.ExpectedSequence;
+    defer seq1.deinit();
+    try std.testing.expectEqualStrings("SEQ1", seq1.name);
+    try std.testing.expectEqual(@as(usize, 4), seq1.dsq.len);
+
+    var seq2 = (try reader.next()) orelse return error.ExpectedSequence;
+    defer seq2.deinit();
+    try std.testing.expectEqualStrings("SEQ2", seq2.name);
+
+    const eof = try reader.next();
+    try std.testing.expectEqual(@as(?Sequence, null), eof);
+}
+
+test "Reader.next: embl auto-detect and iterate" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\ID   SEQ1;
+        \\SQ   Sequence 4 BP;
+        \\     acgt
+        \\//
+        \\ID   SEQ2;
+        \\SQ   Sequence 4 BP;
+        \\     gggg
+        \\//
+        \\
+    ;
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, null);
+    defer reader.deinit();
+
+    try std.testing.expectEqual(Format.embl, reader.format);
+
+    var seq1 = (try reader.next()) orelse return error.ExpectedSequence;
+    defer seq1.deinit();
+    try std.testing.expectEqualStrings("SEQ1", seq1.name);
+
+    var seq2 = (try reader.next()) orelse return error.ExpectedSequence;
+    defer seq2.deinit();
+    try std.testing.expectEqualStrings("SEQ2", seq2.name);
+
+    const eof = try reader.next();
+    try std.testing.expectEqual(@as(?Sequence, null), eof);
 }

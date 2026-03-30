@@ -3,6 +3,7 @@
 const std = @import("std");
 const Sequence = @import("../sequence.zig").Sequence;
 const fasta = @import("fasta.zig");
+const genbank = @import("genbank.zig");
 const Format = @import("reader.zig").Format;
 
 pub const Writer = struct {
@@ -28,6 +29,8 @@ pub const Writer = struct {
         switch (self.format) {
             .fasta => try fasta.write(self.dest, seq, self.line_width),
             .stockholm => try fasta.write(self.dest, seq, self.line_width),
+            .genbank => try genbank.writeGenBank(self.dest, seq),
+            .embl => try genbank.writeEmbl(self.dest, seq),
         }
     }
 
