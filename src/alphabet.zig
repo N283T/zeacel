@@ -62,6 +62,86 @@ pub const Alphabet = struct {
     }
 };
 
+// --- Task 3: Comptime DNA alphabet construction ---
+
+/// Build an encode map at comptime from a symbols string and synonym pairs.
+///
+/// - Each char in `symbols` maps to its index.
+/// - Lowercase versions of each symbol map to the same code.
+/// - Each synonym pair `[2]u8{src, dst}` means encode_map[src] = encode_map[dst].
+///   Lowercase of src is also mapped to the same code.
+fn buildEncodeMap(
+    comptime symbols: []const u8,
+    comptime synonyms: []const [2]u8,
+) [128]u8 {
+    var map = [_]u8{INVALID_CODE} ** 128;
+
+    // Map each symbol and its lowercase to its index.
+    for (symbols, 0..) |sym, i| {
+        map[sym] = @intCast(i);
+        const lower = std.ascii.toLower(sym);
+        if (lower != sym) {
+            map[lower] = @intCast(i);
+        }
+    }
+
+    // Apply synonym pairs: encode_map[src] = encode_map[dst]
+    // Also map lowercase of src.
+    for (synonyms) |pair| {
+        const src = pair[0];
+        const dst = pair[1];
+        map[src] = map[dst];
+        const lower_src = std.ascii.toLower(src);
+        if (lower_src != src) {
+            map[lower_src] = map[dst];
+        }
+    }
+
+    return map;
+}
+
+// DNA symbol string. Positions:
+//   0..3  : canonical residues A, C, G, T
+//   4     : gap (-)
+//   5..14 : degeneracy symbols R, Y, M, K, S, W, H, B, V, D
+//   15    : unknown (N)
+//   16    : nonresidue (*)
+//   17    : missing (~)
+pub const dna_symbols: []const u8 = "ACGT-RYMKSWHBVDN*~";
+
+// Complement table: indexed by digital code, value is complement code.
+// A(0)<->T(3), C(1)<->G(2), -(4)->-(4),
+// R(5)<->Y(6), M(7)<->K(8), S(9)->S(9), W(10)->W(10),
+// H(11)<->D(14), B(12)<->V(13),
+// N(15)->N(15), *(16)->*(16), ~(17)->~(17)
+pub const dna_complement_table: [18]u8 = .{
+    3, 2, 1, 0, // A->T, C->G, G->C, T->A
+    4, // gap->gap
+    6, 5, // R->Y, Y->R
+    8, 7, // M->K, K->M
+    9, 10, // S->S, W->W
+    14, 13, 12, 11, // H->D, B->V, V->B, D->H
+    15, 16, 17, // N->N, *->*, ~->~
+};
+
+// Synonym pairs for DNA: U->T, X->N, I->A, _->-, .->-
+const dna_synonyms: []const [2]u8 = &.{
+    .{ 'U', 'T' },
+    .{ 'X', 'N' },
+    .{ 'I', 'A' },
+    .{ '_', '-' },
+    .{ '.', '-' },
+};
+
+pub const dna: Alphabet = .{
+    .kind = .dna,
+    .k = 4,
+    .kp = 18,
+    .symbols = dna_symbols,
+    .encode_map = buildEncodeMap(dna_symbols, dna_synonyms),
+    .complement = &dna_complement_table,
+};
+
 // --- Tests for Task 2 ---
 
 test "Alphabet: struct size constants for DNA" {
@@ -135,4 +215,66 @@ test "Alphabet: classification methods" {
     try std.testing.expect(alpha.isMissing(17)); // ~
     try std.testing.expect(!alpha.isMissing(16));
     try std.testing.expect(!alpha.isMissing(0));
+}
+
+// --- Tests for Task 3 ---
+
+test "DNA encode canonical residues" {
+    try std.testing.expectEqual(@as(u8, 0), try dna.encode('A'));
+    try std.testing.expectEqual(@as(u8, 1), try dna.encode('C'));
+    try std.testing.expectEqual(@as(u8, 2), try dna.encode('G'));
+    try std.testing.expectEqual(@as(u8, 3), try dna.encode('T'));
+}
+
+test "DNA encode case-insensitive" {
+    try std.testing.expectEqual(@as(u8, 0), try dna.encode('a'));
+    try std.testing.expectEqual(@as(u8, 1), try dna.encode('c'));
+    try std.testing.expectEqual(@as(u8, 2), try dna.encode('g'));
+    try std.testing.expectEqual(@as(u8, 3), try dna.encode('t'));
+}
+
+test "DNA encode synonyms" {
+    // U -> T (3)
+    try std.testing.expectEqual(@as(u8, 3), try dna.encode('U'));
+    try std.testing.expectEqual(@as(u8, 3), try dna.encode('u'));
+    // X -> N (15)
+    try std.testing.expectEqual(@as(u8, 15), try dna.encode('X'));
+    try std.testing.expectEqual(@as(u8, 15), try dna.encode('x'));
+    // _ -> - (4)
+    try std.testing.expectEqual(@as(u8, 4), try dna.encode('_'));
+    // . -> - (4)
+    try std.testing.expectEqual(@as(u8, 4), try dna.encode('.'));
+}
+
+test "DNA encode degeneracies" {
+    try std.testing.expectEqual(@as(u8, 5), try dna.encode('R'));
+    try std.testing.expectEqual(@as(u8, 6), try dna.encode('Y'));
+    try std.testing.expectEqual(@as(u8, 15), try dna.encode('N'));
+}
+
+test "DNA encode invalid characters" {
+    try std.testing.expectError(error.InvalidCharacter, dna.encode('!'));
+    try std.testing.expectError(error.InvalidCharacter, dna.encode('Z'));
+    try std.testing.expectError(error.InvalidCharacter, dna.encode(0));
+}
+
+test "DNA decode" {
+    try std.testing.expectEqual(@as(u8, 'A'), dna.decode(0));
+    try std.testing.expectEqual(@as(u8, 'C'), dna.decode(1));
+    try std.testing.expectEqual(@as(u8, 'G'), dna.decode(2));
+    try std.testing.expectEqual(@as(u8, 'T'), dna.decode(3));
+    try std.testing.expectEqual(@as(u8, '-'), dna.decode(4));
+    try std.testing.expectEqual(@as(u8, 'N'), dna.decode(15));
+}
+
+test "DNA complement table" {
+    // A(0) <-> T(3)
+    try std.testing.expectEqual(@as(u8, 3), dna_complement_table[0]);
+    try std.testing.expectEqual(@as(u8, 0), dna_complement_table[3]);
+    // C(1) <-> G(2)
+    try std.testing.expectEqual(@as(u8, 2), dna_complement_table[1]);
+    try std.testing.expectEqual(@as(u8, 1), dna_complement_table[2]);
+    // R(5) <-> Y(6)
+    try std.testing.expectEqual(@as(u8, 6), dna_complement_table[5]);
+    try std.testing.expectEqual(@as(u8, 5), dna_complement_table[6]);
 }
