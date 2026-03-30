@@ -392,32 +392,39 @@ pub fn writeEmbl(dest: std.io.AnyWriter, seq: Sequence) !void {
 
     try dest.print("SQ   Sequence {d} BP;\n", .{text.len});
 
-    // EMBL sequence: 60 per line, 10 per chunk, number at end, 5-space indent
+    // EMBL sequence: 60 per line in 10-char chunks, position number right-justified
+    // Build each line in a fixed buffer to avoid AnyWriter arithmetic issues
     var i: usize = 0;
     while (i < text.len) {
         const line_end = @min(i + 60, text.len);
-        try dest.writeAll("     ");
+        // Build line content: "     " + chunks separated by spaces
+        var line_buf: [80]u8 = undefined;
+        var pos: usize = 0;
+        // 5-space indent
+        @memcpy(line_buf[0..5], "     ");
+        pos = 5;
         var j = i;
         while (j < line_end) {
             const chunk_end = @min(j + 10, line_end);
             var k = j;
             while (k < chunk_end) : (k += 1) {
-                try dest.writeByte(std.ascii.toLower(text[k]));
+                line_buf[pos] = std.ascii.toLower(text[k]);
+                pos += 1;
             }
             j = chunk_end;
-            if (j < line_end) try dest.writeByte(' ');
+            if (j < line_end) {
+                line_buf[pos] = ' ';
+                pos += 1;
+            }
         }
-        // Pad to 66 chars before the position count (standard EMBL)
-        // Position is right-justified at column 72 (60 residue chars + spaces)
-        const residues_written = line_end - i;
-        const chunks = (residues_written + 9) / 10;
-        const chars_written = residues_written + (chunks - 1); // letters + spaces between chunks
-        const target_width = 66 - 5; // 61; 5 is the indent
-        const pad = if (chars_written < target_width) target_width - chars_written else 0;
-        var p: usize = 0;
-        while (p < pad) : (p += 1) {
-            try dest.writeByte(' ');
+        // Pad with spaces to column 70, then write position number
+        while (pos < 70) {
+            line_buf[pos] = ' ';
+            pos += 1;
         }
+        // Write the buffered line content
+        try dest.writeAll(line_buf[0..pos]);
+        // Write position number and newline
         try dest.print("{d:>10}\n", .{line_end});
         i = line_end;
     }
@@ -705,4 +712,17 @@ test "EMBL round-trip: write then parse" {
     try std.testing.expectEqualStrings("X56734", parsed[0].name);
     try std.testing.expectEqualStrings("X56734", parsed[0].accession.?);
     try std.testing.expectEqualSlices(u8, seq.dsq, parsed[0].dsq);
+}
+
+test "writeEmbl: exactly 60 residues" {
+    const allocator = std.testing.allocator;
+    var seq = try Sequence.fromText(allocator, &alphabet_mod.amino, "test60", "ACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWY");
+    defer seq.deinit();
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+
+    try writeEmbl(buf.writer(allocator).any(), seq);
+    const out = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, out, "//") != null);
 }
