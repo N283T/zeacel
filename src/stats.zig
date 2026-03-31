@@ -6,6 +6,8 @@ pub const dirichlet = @import("stats/dirichlet.zig");
 pub const minimizer = @import("stats/minimizer.zig");
 pub const rootfinder = @import("stats/rootfinder.zig");
 pub const histogram = @import("stats/histogram.zig");
+pub const normal = @import("stats/normal.zig");
+pub const weibull = @import("stats/weibull.zig");
 
 test {
     _ = gumbel;
@@ -15,4 +17,6 @@ test {
     _ = minimizer;
     _ = rootfinder;
     _ = histogram;
+    _ = normal;
+    _ = weibull;
 }
