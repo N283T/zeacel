@@ -44,6 +44,80 @@ pub const Random = struct {
         return mag * math.cos(2.0 * math.pi * t);
     }
 
+    /// Uniform random float in (0, 1), excluding 0.
+    /// Important for log-based sampling where ln(0) is undefined.
+    pub fn uniformPositive(self: *Random) f64 {
+        var x: f64 = 0.0;
+        while (x == 0.0) {
+            x = self.uniform();
+        }
+        return x;
+    }
+
+    /// Gamma-distributed random deviate with shape parameter `alpha` and scale 1.
+    /// Uses Knuth's algorithms: integer gamma for small integer alpha,
+    /// Ahrens' method for alpha >= 3, Knuth's exercise 16 for fractional parts.
+    pub fn gamma(self: *Random, alpha: f64) f64 {
+        std.debug.assert(alpha > 0.0);
+
+        const aint = @floor(alpha);
+        if (alpha == aint and alpha < 12.0) {
+            return gammaInteger(self, @intFromFloat(alpha));
+        } else if (alpha > 3.0) {
+            return gammaAhrens(self, alpha);
+        } else if (alpha < 1.0) {
+            return gammaFraction(self, alpha);
+        } else {
+            return gammaInteger(self, @intFromFloat(aint)) + gammaFraction(self, alpha - aint);
+        }
+    }
+
+    /// Gamma deviate for small positive integer alpha (alpha < 12).
+    /// Product of alpha uniform positive deviates, then -log.
+    fn gammaInteger(self: *Random, a: u32) f64 {
+        var u: f64 = 1.0;
+        for (0..a) |_| {
+            u *= self.uniformPositive();
+        }
+        return -math.log(f64, math.e, u);
+    }
+
+    /// Gamma deviate for alpha >= 3 using Ahrens-Dieter acceptance-rejection.
+    fn gammaAhrens(self: *Random, a: f64) f64 {
+        while (true) {
+            var y: f64 = undefined;
+            var x: f64 = undefined;
+            while (true) {
+                y = math.tan(math.pi * self.uniform());
+                x = y * math.sqrt(2.0 * a - 1.0) + a - 1.0;
+                if (x > 0.0) break;
+            }
+            const v = self.uniform();
+            const test_val = (1.0 + y * y) * math.exp((a - 1.0) * math.log(f64, math.e, x / (a - 1.0)) - y * math.sqrt(2.0 * a - 1.0));
+            if (v <= test_val) return x;
+        }
+    }
+
+    /// Gamma deviate for fractional alpha in (0, 1) using Knuth 3.4.1 exercise 16.
+    fn gammaFraction(self: *Random, a: f64) f64 {
+        const p = math.e / (a + math.e);
+        while (true) {
+            const u = self.uniform();
+            const v = self.uniformPositive();
+            var x: f64 = undefined;
+            var q: f64 = undefined;
+            if (u < p) {
+                x = math.pow(f64, v, 1.0 / a);
+                q = math.exp(-x);
+            } else {
+                x = 1.0 - math.log(f64, math.e, v);
+                q = math.pow(f64, x, a - 1.0);
+            }
+            const u_accept = self.uniform();
+            if (u_accept < q) return x;
+        }
+    }
+
     /// Random choice from a probability distribution p[0..n-1].
     /// p must sum to approximately 1.0 and all values must be non-negative.
     /// Returns the index of the chosen residue.
@@ -132,6 +206,58 @@ test "choose: deterministic with biased distribution" {
     for (0..100) |_| {
         try std.testing.expectEqual(@as(usize, 2), rng.choose(&freq));
     }
+}
+
+test "uniformPositive: all values in (0, 1)" {
+    var rng = Random.init(42);
+    for (0..1000) |_| {
+        const v = rng.uniformPositive();
+        try std.testing.expect(v > 0.0);
+        try std.testing.expect(v < 1.0);
+    }
+}
+
+test "gamma: integer alpha — mean near alpha over 2000 samples" {
+    var rng = Random.init(7777);
+    const alpha = 5.0;
+    var sum: f64 = 0.0;
+    const n: f64 = 2000.0;
+    for (0..@intFromFloat(n)) |_| {
+        const v = rng.gamma(alpha);
+        try std.testing.expect(v > 0.0);
+        sum += v;
+    }
+    const mean = sum / n;
+    // Gamma(alpha, 1) has mean = alpha. Tolerance ~0.5 for 2000 samples.
+    try std.testing.expect(@abs(mean - alpha) < 0.5);
+}
+
+test "gamma: fractional alpha — mean near alpha over 2000 samples" {
+    var rng = Random.init(8888);
+    const alpha = 0.5;
+    var sum: f64 = 0.0;
+    const n: f64 = 2000.0;
+    for (0..@intFromFloat(n)) |_| {
+        const v = rng.gamma(alpha);
+        try std.testing.expect(v > 0.0);
+        sum += v;
+    }
+    const mean = sum / n;
+    try std.testing.expect(@abs(mean - alpha) < 0.3);
+}
+
+test "gamma: large alpha (Ahrens) — mean near alpha" {
+    var rng = Random.init(9999);
+    const alpha = 10.0;
+    var sum: f64 = 0.0;
+    const n: f64 = 2000.0;
+    for (0..@intFromFloat(n)) |_| {
+        const v = rng.gamma(alpha);
+        try std.testing.expect(v > 0.0);
+        sum += v;
+    }
+    const mean = sum / n;
+    try std.testing.expect(@abs(mean - alpha) < 1.0);
 }
 
 test "gaussian: mean near 0 and std near 1 over 1000 samples" {

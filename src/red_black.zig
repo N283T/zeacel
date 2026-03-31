@@ -112,6 +112,24 @@ pub const RedBlackTree = struct {
         self.count = 0;
     }
 
+    /// Produce a sorted slice of all values via in-order traversal.
+    /// Equivalent to Easel's esl_red_black_doublekey_convert_to_sorted_linked().
+    /// Caller owns the returned slice and must free it with the same allocator.
+    pub fn toSortedSlice(self: *RedBlackTree, allocator: Allocator) ![]usize {
+        const result = try allocator.alloc(usize, self.count);
+        var idx: usize = 0;
+        inorderCollect(self.root, result, &idx);
+        return result;
+    }
+
+    fn inorderCollect(node: ?*Node, out: []usize, idx: *usize) void {
+        const n = node orelse return;
+        inorderCollect(n.left, out, idx);
+        out[idx.*] = n.value;
+        idx.* += 1;
+        inorderCollect(n.right, out, idx);
+    }
+
     fn freeSubtree(allocator: Allocator, node: ?*Node) void {
         const n = node orelse return;
         freeSubtree(allocator, n.left);
@@ -275,4 +293,56 @@ test "many inserts maintain balance" {
     try std.testing.expectEqual(@as(usize, 100), tree.count);
     try std.testing.expectEqual(@as(?usize, 0), tree.search(0.0));
     try std.testing.expectEqual(@as(?usize, 99), tree.search(99.0));
+}
+
+test "toSortedSlice: returns values in key order" {
+    const allocator = std.testing.allocator;
+    var tree = RedBlackTree.init(allocator);
+    defer tree.deinit();
+
+    // Insert out of order
+    try tree.insert(5.0, 50);
+    try tree.insert(1.0, 10);
+    try tree.insert(9.0, 90);
+    try tree.insert(3.0, 30);
+    try tree.insert(7.0, 70);
+
+    const sorted = try tree.toSortedSlice(allocator);
+    defer allocator.free(sorted);
+
+    try std.testing.expectEqual(@as(usize, 5), sorted.len);
+    try std.testing.expectEqual(@as(usize, 10), sorted[0]);
+    try std.testing.expectEqual(@as(usize, 30), sorted[1]);
+    try std.testing.expectEqual(@as(usize, 50), sorted[2]);
+    try std.testing.expectEqual(@as(usize, 70), sorted[3]);
+    try std.testing.expectEqual(@as(usize, 90), sorted[4]);
+}
+
+test "toSortedSlice: empty tree returns empty slice" {
+    const allocator = std.testing.allocator;
+    var tree = RedBlackTree.init(allocator);
+    defer tree.deinit();
+
+    const sorted = try tree.toSortedSlice(allocator);
+    defer allocator.free(sorted);
+
+    try std.testing.expectEqual(@as(usize, 0), sorted.len);
+}
+
+test "toSortedSlice: 100 sequential inserts produce sorted output" {
+    const allocator = std.testing.allocator;
+    var tree = RedBlackTree.init(allocator);
+    defer tree.deinit();
+
+    for (0..100) |i| {
+        try tree.insert(@floatFromInt(i), i * 10);
+    }
+
+    const sorted = try tree.toSortedSlice(allocator);
+    defer allocator.free(sorted);
+
+    try std.testing.expectEqual(@as(usize, 100), sorted.len);
+    for (0..100) |i| {
+        try std.testing.expectEqual(i * 10, sorted[i]);
+    }
 }
