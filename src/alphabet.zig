@@ -486,39 +486,96 @@ pub const amino: Alphabet = .{
 
 // --- Task 6: Guess alphabet type from sequence content ---
 
-/// Guess the alphabet type from sequence content.
-/// If any amino-only canonical residues (E, F, I, L, P, Q) are found, returns .amino.
-/// If >80% of recognized residues are nucleic (A,C,G,T,U,N), returns .dna.
-/// Otherwise returns .amino.
-/// Returns null if the sequence is empty or has no recognized residues.
+/// Guess the alphabet type from residue composition, matching Easel's esl_abc_GuessAlphabet().
+///
+/// - Requires minimum 10 residues (returns null if fewer).
+/// - If >2000 residues and all are N, returns .dna (genome assembly scaffolds).
+/// - If any amino-only residues (E,F,I,J,L,O,P,Q,Z) are found, returns .amino.
+/// - If >=98% are nucleotide canonical (ACGT/N or ACGU/N) and all 4 canonicals
+///   present, returns .dna or .rna (RNA if U count > T count).
+/// - If >=98% are amino canonical or X, at least 15 of 20 aa types seen, and
+///   ambiguous residues (DHKMRSVWY) outnumber shared canonicals (ACG), returns .amino.
+/// - Returns null for ambiguous cases.
 pub fn guessType(text: []const u8) ?AlphabetType {
-    var nuc_count: usize = 0;
-    var amino_only_count: usize = 0;
-    var total: usize = 0;
-
+    // Count letters A..Z (case-insensitive), ignoring gaps and non-alpha.
+    var ct: [26]i64 = .{0} ** 26;
     for (text) |c| {
         const upper = if (c >= 'a' and c <= 'z') c - 32 else c;
-        switch (upper) {
-            'A', 'C', 'G', 'T', 'U', 'N' => {
-                nuc_count += 1;
-                total += 1;
-            },
-            'D', 'E', 'F', 'H', 'I', 'K', 'L', 'M', 'P', 'Q', 'R', 'S', 'V', 'W', 'Y' => {
-                switch (upper) {
-                    'E', 'F', 'I', 'L', 'P', 'Q' => amino_only_count += 1,
-                    else => {},
-                }
-                total += 1;
-            },
-            '-', '.', '_', '*', '~' => {},
-            else => {},
+        if (upper >= 'A' and upper <= 'Z') {
+            ct[upper - 'A'] += 1;
         }
     }
 
-    if (total == 0) return null;
-    if (amino_only_count > 0) return .amino;
-    if (nuc_count * 100 / total > 80) return .dna;
-    return .amino;
+    // Total residue count
+    var n: i64 = 0;
+    for (ct) |count| n += count;
+
+    // Minimum 10 residues required
+    if (n <= 10) return null;
+
+    // Amino-only giveaway characters: EFIJLOPQZ
+    const aa_only = "EFIJLOPQZ";
+    var n1: i64 = 0;
+    var x1: i64 = 0;
+    for (aa_only) |ch| {
+        const count = ct[ch - 'A'];
+        if (count > 0) {
+            n1 += count;
+            x1 += 1;
+        }
+    }
+
+    // Shared canonical residues: ACG
+    const all_canon = "ACG";
+    var n2: i64 = 0;
+    var x2: i64 = 0;
+    for (all_canon) |ch| {
+        const count = ct[ch - 'A'];
+        if (count > 0) {
+            n2 += count;
+            x2 += 1;
+        }
+    }
+
+    // Amino-specific canonicals that are also degenerate nucleotides: DHKMRSVWY
+    const aa_canon = "DHKMRSVWY";
+    var n3: i64 = 0;
+    var x3: i64 = 0;
+    for (aa_canon) |ch| {
+        const count = ct[ch - 'A'];
+        if (count > 0) {
+            n3 += count;
+            x3 += 1;
+        }
+    }
+
+    const nt = ct['T' - 'A'];
+    const xt: i64 = if (nt > 0) 1 else 0;
+    const nu = ct['U' - 'A'];
+    const xu: i64 = if (nu > 0) 1 else 0;
+    const nx = ct['X' - 'A'];
+    const nn = ct['N' - 'A'];
+    const xn: i64 = if (nn > 0) 1 else 0;
+
+    // Special case: all N's with >2000 residues -> DNA (genome assembly scaffolds)
+    if (n > 2000 and nn == n) return .dna;
+
+    // Amino-only giveaway characters present -> amino
+    if (n1 > 0) return .amino;
+
+    // Nearly all DNA canonical (ACGT + N), all four ACGT seen
+    if (n - (n2 + nt + nn) <= @divTrunc(n * 2, 100) and x2 + xt == 4) return .dna;
+
+    // Nearly all RNA canonical (ACGU + N), all four ACGU seen
+    if (n - (n2 + nu + nn) <= @divTrunc(n * 2, 100) and x2 + xu == 4) return .rna;
+
+    // Nearly all amino canonical or X, at least 15 of 20 aa types seen,
+    // and ambiguous residues outnumber shared canonicals
+    if (n - (n1 + n2 + n3 + nn + nt + nx) <= @divTrunc(n * 2, 100) and
+        n3 > n2 and
+        x1 + x2 + x3 + xn + xt >= 15) return .amino;
+
+    return null;
 }
 
 // --- Tests for Task 2 ---
@@ -788,31 +845,55 @@ test "reverseComplement degeneracies RY -> RY" {
 // --- Tests for Task 6: guessType ---
 
 test "guessType: pure DNA returns .dna" {
-    try std.testing.expectEqual(@as(?AlphabetType, .dna), guessType("ACGTACGTACGT"));
+    // Need >10 residues with all 4 canonicals and >=98% nucleotide
+    try std.testing.expectEqual(@as(?AlphabetType, .dna), guessType("ACGTACGTACGTACGTACGT"));
 }
 
 test "guessType: DNA with N's returns .dna" {
-    try std.testing.expectEqual(@as(?AlphabetType, .dna), guessType("ACGTNNNNACGT"));
+    try std.testing.expectEqual(@as(?AlphabetType, .dna), guessType("ACGTNNNNACGTACGTNNNN"));
 }
 
 test "guessType: all canonical amino acids returns .amino" {
-    try std.testing.expectEqual(@as(?AlphabetType, .amino), guessType("ACDEFGHIKLMNPQRSTVWY"));
+    // Contains amino-only giveaway characters (E, F, I, L, P, Q)
+    try std.testing.expectEqual(@as(?AlphabetType, .amino), guessType("ACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWY"));
 }
 
 test "guessType: DNA mixed with amino-only residues returns .amino" {
-    try std.testing.expectEqual(@as(?AlphabetType, .amino), guessType("ACGTEF"));
+    // Contains E and F which are amino-only giveaway characters
+    try std.testing.expectEqual(@as(?AlphabetType, .amino), guessType("ACGTACGTACGTEF"));
 }
 
 test "guessType: empty string returns null" {
     try std.testing.expectEqual(@as(?AlphabetType, null), guessType(""));
 }
 
+test "guessType: too few residues returns null" {
+    // 10 or fewer residues should return null
+    try std.testing.expectEqual(@as(?AlphabetType, null), guessType("ACGTACGT"));
+    try std.testing.expectEqual(@as(?AlphabetType, null), guessType("ACGTACGTAC"));
+}
+
 test "guessType: lowercase DNA returns .dna" {
-    try std.testing.expectEqual(@as(?AlphabetType, .dna), guessType("acgtacgt"));
+    try std.testing.expectEqual(@as(?AlphabetType, .dna), guessType("acgtacgtacgtacgtacgt"));
 }
 
 test "guessType: gaps only returns null" {
     try std.testing.expectEqual(@as(?AlphabetType, null), guessType("---..."));
+}
+
+test "guessType: RNA detected when U > T" {
+    try std.testing.expectEqual(@as(?AlphabetType, .rna), guessType("ACGUACGUACGUACGUACGU"));
+}
+
+test "guessType: genome assembly N scaffold" {
+    // >2000 N's should be classified as DNA
+    const scaffold = "N" ** 2500;
+    try std.testing.expectEqual(@as(?AlphabetType, .dna), guessType(scaffold));
+}
+
+test "guessType: ambiguous short sequence returns null" {
+    // Only ACG present, no T/U, not enough distinct types for amino
+    try std.testing.expectEqual(@as(?AlphabetType, null), guessType("ACGACGACGACGACG"));
 }
 
 // --- Tests for degeneracy functions ---

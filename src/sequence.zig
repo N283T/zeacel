@@ -124,8 +124,23 @@ pub const Sequence = struct {
     }
 
     /// Reverse complement in place (DNA/RNA only).
+    /// Swaps source start/end coordinates and invalidates secondary structure.
     pub fn reverseComplement(self: *Sequence) !void {
         try self.abc.reverseComplement(self.dsq);
+        // Swap source coordinates to reflect reverse strand
+        if (self.source) |src| {
+            self.source = Source{
+                .name = src.name,
+                .start = src.end,
+                .end = src.start,
+                .full_length = src.full_length,
+            };
+        }
+        // Secondary structure is invalidated by reverse complement
+        if (self.secondary_structure) |ss| {
+            self.allocator.free(ss);
+            self.secondary_structure = null;
+        }
     }
 
     /// Extract subsequence [start..end) (0-indexed, half-open). Returns new Sequence with Source tracking.
@@ -206,15 +221,32 @@ pub const Sequence = struct {
         return val;
     }
 
-    /// Count residue frequencies. Returns array of length abc.kp.
-    /// Caller owns the returned slice.
+    /// Count residue frequencies. Returns array of length abc.K (canonical residues only).
+    /// Degenerate residues are distributed equally across their constituent canonical
+    /// residues using the degeneracy bitmask. Gaps, missing data, and nonresidue
+    /// symbols are ignored. Caller owns the returned slice.
     pub fn countResidues(self: Sequence) ![]f64 {
-        const kp: usize = @intCast(self.abc.kp);
-        const counts = try self.allocator.alloc(f64, kp);
+        const k: usize = @intCast(self.abc.k);
+        const counts = try self.allocator.alloc(f64, k);
         @memset(counts, 0.0);
         for (self.dsq) |code| {
-            if (code < kp) {
+            if (self.abc.isCanonical(code)) {
+                // Canonical residue: count directly
                 counts[code] += 1.0;
+            } else if (self.abc.isGap(code) or self.abc.isMissing(code) or self.abc.isNonresidue(code)) {
+                // Skip gaps, missing data, nonresidue
+                continue;
+            } else if (code < self.abc.kp) {
+                // Degenerate or unknown: distribute weight equally across constituents
+                const ndegen = self.abc.ndegen[code];
+                if (ndegen == 0) continue;
+                const mask = self.abc.degen[code];
+                const wt: f64 = 1.0 / @as(f64, @floatFromInt(ndegen));
+                for (0..k) |y| {
+                    if (mask & (@as(u32, 1) << @intCast(y)) != 0) {
+                        counts[y] += wt;
+                    }
+                }
             }
         }
         return counts;
@@ -415,6 +447,34 @@ test "reverseComplement: amino acid returns error" {
     try std.testing.expectError(error.NoComplement, seq.reverseComplement());
 }
 
+test "reverseComplement: swaps source start and end" {
+    const allocator = std.testing.allocator;
+    var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "AACG");
+    defer seq.deinit();
+
+    try seq.setSource("chr1", 100, 200, 50000);
+    try seq.reverseComplement();
+
+    // start and end should be swapped
+    try std.testing.expectEqual(@as(i64, 200), seq.source.?.start);
+    try std.testing.expectEqual(@as(i64, 100), seq.source.?.end);
+    try std.testing.expectEqual(@as(i64, 50000), seq.source.?.full_length);
+}
+
+test "reverseComplement: invalidates secondary structure" {
+    const allocator = std.testing.allocator;
+    var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "AACG");
+    defer seq.deinit();
+
+    // Set secondary structure
+    seq.secondary_structure = try allocator.dupe(u8, "<<>>");
+
+    try seq.reverseComplement();
+
+    // Secondary structure should be null after revcomp
+    try std.testing.expectEqual(@as(?[]const u8, null), seq.secondary_structure);
+}
+
 test "subseq: basic extraction with source tracking" {
     const allocator = std.testing.allocator;
     var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "full", "ACGTACGT");
@@ -503,7 +563,7 @@ test "checksum: different sequences differ" {
     try std.testing.expect(s1.checksum() != s2.checksum());
 }
 
-test "countResidues: AACG -> 2A, 1C, 1G" {
+test "countResidues: AACG -> 2A, 1C, 1G (K-length array)" {
     const allocator = std.testing.allocator;
     var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "AACG");
     defer seq.deinit();
@@ -511,9 +571,26 @@ test "countResidues: AACG -> 2A, 1C, 1G" {
     const counts = try seq.countResidues();
     defer allocator.free(counts);
 
+    // Array length should be K (4 for DNA), not Kp
+    try std.testing.expectEqual(@as(usize, 4), counts.len);
     try std.testing.expectApproxEqAbs(@as(f64, 2.0), counts[0], 1e-9); // A
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), counts[1], 1e-9); // C
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), counts[2], 1e-9); // G
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), counts[3], 1e-9); // T
+}
+
+test "countResidues: degenerate R distributes to A and G" {
+    const allocator = std.testing.allocator;
+    // R = A or G, so should distribute 0.5 to each
+    var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "RR");
+    defer seq.deinit();
+
+    const counts = try seq.countResidues();
+    defer allocator.free(counts);
+
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), counts[0], 1e-9); // A: 2 * 0.5
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), counts[1], 1e-9); // C
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), counts[2], 1e-9); // G: 2 * 0.5
     try std.testing.expectApproxEqAbs(@as(f64, 0.0), counts[3], 1e-9); // T
 }
 
