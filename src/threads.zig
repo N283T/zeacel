@@ -1,7 +1,8 @@
 // Threading infrastructure for parallel pipelines.
 //
-// Provides a thread pool (master/worker model) and a work queue
-// (producer-consumer mailbox pattern) for HMMER-style parallel search.
+// Provides a thread pool (master/worker model), a work queue
+// (producer-consumer mailbox pattern), and a dual work queue
+// (reader/worker buffer-recycling pattern) for HMMER-style parallel search.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -50,19 +51,25 @@ pub fn ThreadPool(comptime Context: type) type {
 
 /// A thread-safe work queue for producer-consumer patterns.
 /// Items are sent by the producer and received by consumers.
+/// Uses a circular buffer for O(1) enqueue and dequeue.
 pub fn WorkQueue(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        items: std.ArrayList(T),
+        buf: []T,
+        head: usize,
+        count: usize,
         mutex: std.Thread.Mutex,
         not_empty: std.Thread.Condition,
         closed: bool,
         allocator: Allocator,
 
-        pub fn init(allocator: Allocator) Self {
+        pub fn init(allocator: Allocator, capacity: usize) !Self {
+            const buf = try allocator.alloc(T, capacity);
             return Self{
-                .items = .empty,
+                .buf = buf,
+                .head = 0,
+                .count = 0,
                 .mutex = .{},
                 .not_empty = .{},
                 .closed = false,
@@ -71,10 +78,14 @@ pub fn WorkQueue(comptime T: type) type {
         }
 
         /// Send an item to the queue. Wakes one waiting consumer.
+        /// Returns error.Overflow if the queue is full.
         pub fn send(self: *Self, item: T) !void {
             self.mutex.lock();
             defer self.mutex.unlock();
-            try self.items.append(self.allocator, item);
+            if (self.count >= self.buf.len) return error.Overflow;
+            const tail = (self.head + self.count) % self.buf.len;
+            self.buf[tail] = item;
+            self.count += 1;
             self.not_empty.signal();
         }
 
@@ -83,12 +94,13 @@ pub fn WorkQueue(comptime T: type) type {
         pub fn receive(self: *Self) ?T {
             self.mutex.lock();
             defer self.mutex.unlock();
-            while (self.items.items.len == 0) {
+            while (self.count == 0) {
                 if (self.closed) return null;
                 self.not_empty.wait(&self.mutex);
             }
-            // Pop from front (FIFO)
-            const item = self.items.orderedRemove(0);
+            const item = self.buf[self.head];
+            self.head = (self.head + 1) % self.buf.len;
+            self.count -= 1;
             return item;
         }
 
@@ -105,11 +117,176 @@ pub fn WorkQueue(comptime T: type) type {
         pub fn len(self: *Self) usize {
             self.mutex.lock();
             defer self.mutex.unlock();
-            return self.items.items.len;
+            return self.count;
         }
 
         pub fn deinit(self: *Self) void {
-            self.items.deinit(self.allocator);
+            self.allocator.free(self.buf);
+        }
+    };
+}
+
+/// A dual work queue for zero-copy buffer recycling between a reader and workers.
+///
+/// Modeled after Easel's ESL_WORK_QUEUE. Two internal circular queues:
+///   - reader queue: holds processed/empty items ready for the reader to fill
+///   - worker queue: holds filled items ready for workers to process
+///
+/// The reader calls `readerUpdate(old, &new)` to return a processed item
+/// and get an empty one. Workers call `workerUpdate(old, &new)` to return
+/// a filled item and get the next one to process.
+pub fn DualWorkQueue(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        reader_buf: []T,
+        reader_head: usize,
+        reader_count: usize,
+
+        worker_buf: []T,
+        worker_head: usize,
+        worker_count: usize,
+
+        capacity: usize,
+        pending_workers: usize,
+
+        mutex: std.Thread.Mutex,
+        reader_cond: std.Thread.Condition,
+        worker_cond: std.Thread.Condition,
+
+        allocator: Allocator,
+
+        pub fn init(allocator: Allocator, capacity: usize) !Self {
+            const reader_buf = try allocator.alloc(T, capacity);
+            errdefer allocator.free(reader_buf);
+            const worker_buf = try allocator.alloc(T, capacity);
+
+            return Self{
+                .reader_buf = reader_buf,
+                .reader_head = 0,
+                .reader_count = 0,
+                .worker_buf = worker_buf,
+                .worker_head = 0,
+                .worker_count = 0,
+                .capacity = capacity,
+                .pending_workers = 0,
+                .mutex = .{},
+                .reader_cond = .{},
+                .worker_cond = .{},
+                .allocator = allocator,
+            };
+        }
+
+        /// Seed the reader queue with an initial item (call before starting workers).
+        /// This is analogous to Easel's esl_workqueue_Init.
+        pub fn addItem(self: *Self, item: T) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.reader_count >= self.capacity) return error.Overflow;
+            const tail = (self.reader_head + self.reader_count) % self.capacity;
+            self.reader_buf[tail] = item;
+            self.reader_count += 1;
+            self.reader_cond.signal();
+        }
+
+        /// Reader (producer) update: atomically enqueue a filled item onto
+        /// the worker queue and dequeue the next empty item from the reader queue.
+        ///
+        /// Pass `null` for `in_item` on the first call to just get an empty item.
+        /// Pass `null` for `out` if you don't need a return item (e.g. final flush).
+        pub fn readerUpdate(self: *Self, in_item: ?T, out: ?*T) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            // Place the filled item on the worker queue.
+            if (in_item) |item| {
+                if (self.worker_count >= self.capacity) return error.Overflow;
+                const tail = (self.worker_head + self.worker_count) % self.capacity;
+                self.worker_buf[tail] = item;
+                self.worker_count += 1;
+
+                // Wake any workers waiting for work.
+                if (self.pending_workers != 0) {
+                    self.worker_cond.broadcast();
+                }
+            }
+
+            // Wait for an empty item on the reader queue.
+            if (out) |ptr| {
+                while (self.reader_count == 0) {
+                    self.reader_cond.wait(&self.mutex);
+                }
+                ptr.* = self.reader_buf[self.reader_head];
+                self.reader_head = (self.reader_head + 1) % self.capacity;
+                self.reader_count -= 1;
+            }
+        }
+
+        /// Worker (consumer) update: atomically return a processed item to the
+        /// reader queue and get the next filled item from the worker queue.
+        ///
+        /// Pass `null` for `in_item` on the first call to just get an item.
+        pub fn workerUpdate(self: *Self, in_item: ?T, out: ?*T) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            // Return the processed item to the reader queue.
+            if (in_item) |item| {
+                const tail = (self.reader_head + self.reader_count) % self.capacity;
+                self.reader_buf[tail] = item;
+                const was_empty = self.reader_count == 0;
+                self.reader_count += 1;
+                if (was_empty) {
+                    self.reader_cond.signal();
+                }
+            }
+
+            // Get the next filled item from the worker queue.
+            if (out) |ptr| {
+                if (self.worker_count == 0) {
+                    self.pending_workers += 1;
+                    while (self.worker_count == 0) {
+                        self.worker_cond.wait(&self.mutex);
+                    }
+                    self.pending_workers -= 1;
+                }
+
+                ptr.* = self.worker_buf[self.worker_head];
+                self.worker_head = (self.worker_head + 1) % self.capacity;
+                self.worker_count -= 1;
+            }
+        }
+
+        /// Signal all waiting workers to wake up. Call after enqueueing
+        /// sentinel/termination items so workers can detect shutdown.
+        pub fn complete(self: *Self) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.pending_workers != 0) {
+                self.worker_cond.broadcast();
+            }
+        }
+
+        /// Reset the queue for reuse by moving all worker-queue items
+        /// back to the reader queue.
+        pub fn reset(self: *Self) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            while (self.worker_count > 0) {
+                const tail = (self.reader_head + self.reader_count) % self.capacity;
+                self.reader_buf[tail] = self.worker_buf[self.worker_head];
+                self.reader_count += 1;
+                self.worker_head = (self.worker_head + 1) % self.capacity;
+                self.worker_count -= 1;
+            }
+
+            self.pending_workers = 0;
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.allocator.free(self.reader_buf);
+            self.allocator.free(self.worker_buf);
         }
     };
 }
@@ -122,7 +299,7 @@ pub fn cpuCount() usize {
 // --- Tests ---
 
 test "WorkQueue: send and receive" {
-    var q = WorkQueue(u32).init(std.testing.allocator);
+    var q = try WorkQueue(u32).init(std.testing.allocator, 16);
     defer q.deinit();
 
     try q.send(42);
@@ -133,7 +310,7 @@ test "WorkQueue: send and receive" {
 }
 
 test "WorkQueue: close returns null" {
-    var q = WorkQueue(u32).init(std.testing.allocator);
+    var q = try WorkQueue(u32).init(std.testing.allocator, 16);
     defer q.deinit();
 
     try q.send(1);
@@ -143,8 +320,17 @@ test "WorkQueue: close returns null" {
     try std.testing.expectEqual(@as(?u32, null), q.receive());
 }
 
+test "WorkQueue: overflow returns error" {
+    var q = try WorkQueue(u32).init(std.testing.allocator, 2);
+    defer q.deinit();
+
+    try q.send(1);
+    try q.send(2);
+    try std.testing.expectError(error.Overflow, q.send(3));
+}
+
 test "WorkQueue: threaded producer-consumer" {
-    var q = WorkQueue(u32).init(std.testing.allocator);
+    var q = try WorkQueue(u32).init(std.testing.allocator, 16);
     defer q.deinit();
 
     const producer = try std.Thread.spawn(.{}, struct {
@@ -163,6 +349,126 @@ test "WorkQueue: threaded producer-consumer" {
     producer.join();
 
     try std.testing.expectEqual(@as(u32, 45), sum); // 0+1+...+9
+}
+
+test "WorkQueue: FIFO ordering with wraparound" {
+    var q = try WorkQueue(u32).init(std.testing.allocator, 4);
+    defer q.deinit();
+
+    // Fill and drain to advance head past start
+    try q.send(10);
+    try q.send(20);
+    try std.testing.expectEqual(@as(?u32, 10), q.receive());
+    try std.testing.expectEqual(@as(?u32, 20), q.receive());
+
+    // Now head is at index 2; fill all 4 slots to force wraparound
+    try q.send(1);
+    try q.send(2);
+    try q.send(3);
+    try q.send(4);
+
+    try std.testing.expectEqual(@as(?u32, 1), q.receive());
+    try std.testing.expectEqual(@as(?u32, 2), q.receive());
+    try std.testing.expectEqual(@as(?u32, 3), q.receive());
+    try std.testing.expectEqual(@as(?u32, 4), q.receive());
+}
+
+test "DualWorkQueue: single-threaded round-trip" {
+    var q = try DualWorkQueue(u32).init(std.testing.allocator, 4);
+    defer q.deinit();
+
+    // Seed two empty buffers (values don't matter yet)
+    try q.addItem(0);
+    try q.addItem(0);
+
+    // Reader gets an empty buffer, fills it, sends it
+    var buf: u32 = undefined;
+    try q.readerUpdate(null, &buf); // get empty buffer
+    buf = 42;
+    try q.readerUpdate(buf, &buf); // send filled, get next empty
+    buf = 99;
+    try q.readerUpdate(buf, null); // send filled, don't wait for empty
+
+    // Worker gets filled items
+    var work: u32 = undefined;
+    q.workerUpdate(null, &work); // get first filled item
+    try std.testing.expectEqual(@as(u32, 42), work);
+    q.workerUpdate(work, &work); // return processed, get next
+    try std.testing.expectEqual(@as(u32, 99), work);
+    q.workerUpdate(work, null); // return last, don't wait
+}
+
+test "DualWorkQueue: threaded reader-worker pipeline" {
+    const ncpu = 2;
+    const n_items = 20;
+
+    var q = try DualWorkQueue(u32).init(std.testing.allocator, ncpu * 2);
+    defer q.deinit();
+
+    // Seed empty buffers
+    for (0..ncpu * 2) |_| {
+        try q.addItem(0);
+    }
+
+    var result_sum = std.atomic.Value(u32).init(0);
+
+    // Spawn worker threads
+    var workers: [ncpu]std.Thread = undefined;
+    for (0..ncpu) |i| {
+        workers[i] = try std.Thread.spawn(.{}, struct {
+            fn run(queue: *DualWorkQueue(u32), sum: *std.atomic.Value(u32)) void {
+                var item: u32 = undefined;
+                queue.workerUpdate(null, &item);
+                while (item > 0) {
+                    _ = sum.fetchAdd(item, .monotonic);
+                    queue.workerUpdate(item, &item);
+                }
+                // Return the sentinel
+                queue.workerUpdate(item, null);
+            }
+        }.run, .{ &q, &result_sum });
+    }
+
+    // Reader: fill items 1..n_items, then send ncpu sentinels (0)
+    var buf: u32 = undefined;
+    try q.readerUpdate(null, &buf);
+    for (1..n_items + 1) |i| {
+        buf = @intCast(i);
+        try q.readerUpdate(buf, &buf);
+    }
+    // Send sentinel for each worker
+    for (0..ncpu) |_| {
+        buf = 0;
+        try q.readerUpdate(buf, &buf);
+    }
+
+    for (0..ncpu) |i| workers[i].join();
+
+    // Sum of 1..20 = 210
+    try std.testing.expectEqual(@as(u32, 210), result_sum.load(.monotonic));
+}
+
+test "DualWorkQueue: reset moves items back to reader queue" {
+    var q = try DualWorkQueue(u32).init(std.testing.allocator, 4);
+    defer q.deinit();
+
+    try q.addItem(1);
+    try q.addItem(2);
+
+    // Reader sends both to worker queue
+    var buf: u32 = undefined;
+    try q.readerUpdate(null, &buf);
+    buf = 10;
+    try q.readerUpdate(buf, &buf);
+    buf = 20;
+    try q.readerUpdate(buf, null);
+
+    // Reset moves worker items back to reader queue
+    q.reset();
+
+    // Reader should be able to get items back
+    try q.readerUpdate(null, &buf);
+    try std.testing.expect(buf == 10 or buf == 20);
 }
 
 test "cpuCount: at least 1" {

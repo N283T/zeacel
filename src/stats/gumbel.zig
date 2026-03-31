@@ -159,6 +159,157 @@ pub fn fitComplete(x: []const f64) !struct { mu: f64, lambda: f64 } {
     return .{ .mu = mu, .lambda = lambda };
 }
 
+/// MLE of mu given known lambda, from complete data.
+///
+/// Formula (Lawless 4.1.5):
+///   mu = -(1/lambda) * log( (1/n) * sum(exp(-lambda * xi)) )
+pub fn fitCompleteLoc(x: []const f64, known_lambda: f64) !f64 {
+    if (x.len < 2) return error.InsufficientData;
+
+    const n: f64 = @floatFromInt(x.len);
+    var esum: f64 = 0.0;
+    for (x) |xi| {
+        esum += @exp(-known_lambda * xi);
+    }
+    return -@log(esum / n) / known_lambda;
+}
+
+/// Evaluate Lawless equation 4.2.2 and its derivative for censored Gumbel MLE.
+///
+/// `x` contains observed (uncensored) values, `z` is the count of censored samples,
+/// `phi` is the censoring threshold, `lambda` is the current estimate.
+/// Returns (f, df) where f=0 at the MLE lambda.
+fn lawless422(x: []const f64, z: f64, phi: f64, lambda: f64) struct { f: f64, df: f64 } {
+    const n: f64 = @floatFromInt(x.len);
+
+    var esum: f64 = 0.0;
+    var xesum: f64 = 0.0;
+    var xxesum: f64 = 0.0;
+    var xsum: f64 = 0.0;
+    for (x) |xi| {
+        const e = @exp(-lambda * xi);
+        xsum += xi;
+        esum += e;
+        xesum += xi * e;
+        xxesum += xi * xi * e;
+    }
+
+    // Add censored data terms.
+    const ep = @exp(-lambda * phi);
+    esum += z * ep;
+    xesum += z * phi * ep;
+    xxesum += z * phi * phi * ep;
+
+    const f = 1.0 / lambda - xsum / n + xesum / esum;
+    const ratio = xesum / esum;
+    const df = ratio * ratio - xxesum / esum - 1.0 / (lambda * lambda);
+    return .{ .f = f, .df = df };
+}
+
+/// Left-censored MLE of Gumbel parameters.
+///
+/// `x` contains only the observed (uncensored) values (x_i >= phi).
+/// `n_total` is total number of samples including censored.
+/// `phi` is the censoring threshold.
+///
+/// Uses Newton-Raphson on Lawless equation 4.2.2 with bisection fallback.
+/// Reference: Easel esl_gumbel_FitCensored().
+pub fn fitCensored(x: []const f64, n_total: usize, phi: f64) !struct { mu: f64, lambda: f64 } {
+    const n_obs = x.len;
+    if (n_obs < 2) return error.InsufficientData;
+    if (n_total < n_obs) return error.InvalidArgument;
+
+    const n: f64 = @floatFromInt(n_obs);
+    const z: f64 = @floatFromInt(n_total - n_obs); // number of censored samples
+
+    // Initial lambda estimate from method of moments on observed data.
+    var sum: f64 = 0.0;
+    for (x) |xi| sum += xi;
+    const mean = sum / n;
+
+    var var_sum: f64 = 0.0;
+    for (x) |xi| {
+        const d = xi - mean;
+        var_sum += d * d;
+    }
+    const variance = var_sum / n;
+    if (variance == 0.0) return error.ZeroVariance;
+
+    var lambda = math.pi / @sqrt(6.0 * variance);
+
+    // Newton-Raphson iteration for lambda.
+    const tol: f64 = 1e-5;
+    var converged = false;
+    for (0..100) |_| {
+        const r = lawless422(x, z, phi, lambda);
+        if (@abs(r.f) < tol) {
+            converged = true;
+            break;
+        }
+        lambda -= r.f / r.df;
+        if (lambda <= 0.0) lambda = 0.001;
+    }
+
+    // Bisection fallback if Newton-Raphson did not converge.
+    if (!converged) {
+        var left: f64 = 0.001;
+        var right: f64 = math.pi / @sqrt(6.0 * variance);
+        // Bracket the root: ensure f(right) < 0.
+        var r = lawless422(x, z, phi, right);
+        while (r.f > 0.0) {
+            right *= 2.0;
+            if (right > 1000.0) return error.NoResult;
+            r = lawless422(x, z, phi, right);
+        }
+        for (0..100) |_| {
+            const mid = (left + right) / 2.0;
+            const rm = lawless422(x, z, phi, mid);
+            if (@abs(rm.f) < tol) break;
+            if (rm.f > 0.0) {
+                left = mid;
+            } else {
+                right = mid;
+            }
+        }
+        lambda = (left + right) / 2.0;
+    }
+
+    // Substitute into Lawless 4.2.3 to find mu.
+    var esum: f64 = 0.0;
+    for (x) |xi| esum += @exp(-lambda * xi);
+    esum += z * @exp(-lambda * phi);
+    const mu = -@log(esum / n) / lambda;
+
+    return .{ .mu = mu, .lambda = lambda };
+}
+
+/// Censored MLE of mu given known lambda.
+///
+/// `x` contains only observed values (x_i >= phi).
+/// `n_total` is total count including censored.
+/// `phi` is the censoring threshold.
+///
+/// Formula (Lawless 4.2.3 with known lambda):
+///   mu = -(1/lambda) * log( (1/n) * (sum(exp(-lambda*xi)) + z*exp(-lambda*phi)) )
+///
+/// Reference: Easel esl_gumbel_FitCensoredLoc().
+pub fn fitCensoredLoc(x: []const f64, n_total: usize, phi: f64, known_lambda: f64) !f64 {
+    const n_obs = x.len;
+    if (n_obs < 2) return error.InsufficientData;
+    if (n_total < n_obs) return error.InvalidArgument;
+
+    const n: f64 = @floatFromInt(n_obs);
+    const z: f64 = @floatFromInt(n_total - n_obs);
+
+    var esum: f64 = 0.0;
+    for (x) |xi| {
+        esum += @exp(-known_lambda * xi);
+    }
+    esum += z * @exp(-known_lambda * phi);
+
+    return -@log(esum / n) / known_lambda;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -236,4 +387,93 @@ test "gumbel fitComplete recovers parameters" {
 test "gumbel fitComplete error on small input" {
     const x = [_]f64{1.0};
     try std.testing.expectError(error.InsufficientData, fitComplete(&x));
+}
+
+test "gumbel fitCompleteLoc recovers mu" {
+    const true_mu: f64 = 10.0;
+    const true_lambda: f64 = 0.5;
+    const n = 2000;
+
+    var samples: [n]f64 = undefined;
+    var state: u64 = 12345;
+    for (&samples) |*s| {
+        state = (state *% 1664525 +% 1013904223) & 0xFFFFFFFF;
+        const u = @as(f64, @floatFromInt(state + 1)) / @as(f64, 0x100000000);
+        s.* = invcdf(u, true_mu, true_lambda);
+    }
+
+    const mu = try fitCompleteLoc(&samples, true_lambda);
+    try std.testing.expect(math.approxEqAbs(f64, mu, true_mu, 0.3));
+}
+
+test "gumbel fitCompleteLoc error on small input" {
+    const x = [_]f64{1.0};
+    try std.testing.expectError(error.InsufficientData, fitCompleteLoc(&x, 0.5));
+}
+
+test "gumbel fitCensored recovers parameters" {
+    const true_mu: f64 = 10.0;
+    const true_lambda: f64 = 0.5;
+    const n = 2000;
+
+    // Generate samples.
+    var all_samples: [n]f64 = undefined;
+    var state: u64 = 54321;
+    for (&all_samples) |*s| {
+        state = (state *% 1664525 +% 1013904223) & 0xFFFFFFFF;
+        const u = @as(f64, @floatFromInt(state + 1)) / @as(f64, 0x100000000);
+        s.* = invcdf(u, true_mu, true_lambda);
+    }
+
+    // Censor: keep only values >= phi.
+    const phi: f64 = 10.0;
+    var observed: [n]f64 = undefined;
+    var n_obs: usize = 0;
+    for (&all_samples) |s| {
+        if (s >= phi) {
+            observed[n_obs] = s;
+            n_obs += 1;
+        }
+    }
+
+    const fit = try fitCensored(observed[0..n_obs], n, phi);
+    try std.testing.expect(math.approxEqAbs(f64, fit.mu, true_mu, 0.5));
+    try std.testing.expect(math.approxEqAbs(f64, fit.lambda, true_lambda, 0.1));
+}
+
+test "gumbel fitCensored error on small input" {
+    const x = [_]f64{1.0};
+    try std.testing.expectError(error.InsufficientData, fitCensored(&x, 10, 0.0));
+}
+
+test "gumbel fitCensoredLoc recovers mu" {
+    const true_mu: f64 = 10.0;
+    const true_lambda: f64 = 0.5;
+    const n = 2000;
+
+    var all_samples: [n]f64 = undefined;
+    var state: u64 = 54321;
+    for (&all_samples) |*s| {
+        state = (state *% 1664525 +% 1013904223) & 0xFFFFFFFF;
+        const u = @as(f64, @floatFromInt(state + 1)) / @as(f64, 0x100000000);
+        s.* = invcdf(u, true_mu, true_lambda);
+    }
+
+    const phi: f64 = 10.0;
+    var observed: [n]f64 = undefined;
+    var n_obs: usize = 0;
+    for (&all_samples) |s| {
+        if (s >= phi) {
+            observed[n_obs] = s;
+            n_obs += 1;
+        }
+    }
+
+    const mu = try fitCensoredLoc(observed[0..n_obs], n, phi, true_lambda);
+    try std.testing.expect(math.approxEqAbs(f64, mu, true_mu, 0.5));
+}
+
+test "gumbel fitCensoredLoc error on small input" {
+    const x = [_]f64{1.0};
+    try std.testing.expectError(error.InsufficientData, fitCensoredLoc(&x, 10, 0.0, 0.5));
 }

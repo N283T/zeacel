@@ -127,6 +127,28 @@ pub fn blosum(allocator: Allocator, m: Msa, id_threshold: f64) ![]f64 {
     return weights;
 }
 
+/// Filter sequences by percent identity using a greedy algorithm.
+/// Returns a boolean mask where `keep[i] = true` means sequence i is retained.
+/// Sequences are considered in input order; the first sequence is always kept,
+/// and subsequent sequences are removed if they exceed `max_id` identity with
+/// any already-kept sequence. Caller owns the returned slice.
+pub fn idFilter(allocator: Allocator, m: Msa, max_id: f64) ![]bool {
+    const n = m.nseq();
+    const keep = try allocator.alloc(bool, n);
+    @memset(keep, true);
+
+    for (0..n) |i| {
+        if (!keep[i]) continue;
+        for (i + 1..n) |j| {
+            if (!keep[j]) continue;
+            if (pairwiseIdentity(m, i, j) > max_id) {
+                keep[j] = false;
+            }
+        }
+    }
+    return keep;
+}
+
 // TODO: GSC (Gerstein-Sonnhammer-Chothia) weights require a guide tree.
 // Depends on issue #13 (phylogenetic trees). Implement after that is available.
 
