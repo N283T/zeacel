@@ -652,6 +652,122 @@ fn genericLinkage(allocator: Allocator, dist: []const f64, n: usize, leaf_names:
     };
 }
 
+/// Generate a random binary tree by random sequential addition.
+/// Each new leaf is attached at a random existing branch, splitting it
+/// into two segments. Branch lengths are drawn from an exponential
+/// distribution (uniform random, so the tree is not ultrametric).
+///
+/// `n_leaves` must be >= 2. Leaf names are "leaf0", "leaf1", etc.
+pub fn simulate(allocator: Allocator, n_leaves: usize, rng: *Random) !Tree {
+    if (n_leaves < 2) return error.InvalidInput;
+
+    const total_nodes = 2 * n_leaves - 1;
+
+    var parent_arr = try allocator.alloc(i32, total_nodes);
+    errdefer allocator.free(parent_arr);
+    @memset(parent_arr, -1);
+
+    var left_arr = try allocator.alloc(i32, total_nodes);
+    errdefer allocator.free(left_arr);
+    @memset(left_arr, -1);
+
+    var right_arr = try allocator.alloc(i32, total_nodes);
+    errdefer allocator.free(right_arr);
+    @memset(right_arr, -1);
+
+    var bl = try allocator.alloc(f64, total_nodes);
+    errdefer allocator.free(bl);
+    @memset(bl, 0.0);
+
+    var names_arr = try allocator.alloc(?[]const u8, total_nodes);
+    errdefer {
+        for (names_arr) |nm| if (nm) |name_v| allocator.free(name_v);
+        allocator.free(names_arr);
+    }
+    @memset(names_arr, null);
+
+    // Generate leaf names.
+    for (0..n_leaves) |i| {
+        names_arr[i] = try std.fmt.allocPrint(allocator, "leaf{d}", .{i});
+    }
+
+    // Start with a tree of 2 leaves joined by an internal node.
+    const first_internal = n_leaves; // index of first internal node
+    left_arr[first_internal] = 0;
+    right_arr[first_internal] = 1;
+    parent_arr[0] = @intCast(first_internal);
+    parent_arr[1] = @intCast(first_internal);
+    bl[0] = rng.uniform() + 0.01;
+    bl[1] = rng.uniform() + 0.01;
+
+    var next_internal = first_internal + 1;
+
+    // Sequentially add remaining leaves.
+    for (2..n_leaves) |leaf| {
+        // Pick a random existing node (excluding the current root) to split.
+        // Existing nodes are 0..(leaf-1) leaves + first_internal..(next_internal-1) internals.
+        // We pick from all non-root nodes (those with parent != -1).
+        // Actually simpler: pick a random edge. An edge is identified by its
+        // child node (every node except root has exactly one incoming edge).
+        // Count non-root nodes so far.
+        const n_edges = leaf + (next_internal - first_internal) - 1;
+        const pick = rng.uniformInt(@intCast(n_edges));
+
+        // Enumerate non-root nodes to find the picked one.
+        var target: usize = 0;
+        var count: u32 = 0;
+        for (0..next_internal + 1) |node| {
+            if (node >= total_nodes) continue;
+            if (parent_arr[node] == -1) continue;
+            if (count == pick) {
+                target = node;
+                break;
+            }
+            count += 1;
+        }
+
+        // Insert a new internal node on the edge from target to its parent.
+        const new_internal = next_internal;
+        const old_parent = parent_arr[target];
+        const old_parent_u: usize = @intCast(old_parent);
+
+        // Replace target in old_parent's children with new_internal.
+        if (left_arr[old_parent_u] == @as(i32, @intCast(target))) {
+            left_arr[old_parent_u] = @intCast(new_internal);
+        } else {
+            right_arr[old_parent_u] = @intCast(new_internal);
+        }
+
+        parent_arr[new_internal] = old_parent;
+        left_arr[new_internal] = @intCast(target);
+        right_arr[new_internal] = @intCast(leaf);
+        parent_arr[target] = @intCast(new_internal);
+        parent_arr[leaf] = @intCast(new_internal);
+
+        // Split the original branch length.
+        const orig_bl = bl[target];
+        const frac = rng.uniform();
+        bl[new_internal] = orig_bl * frac;
+        bl[target] = orig_bl * (1.0 - frac);
+        bl[leaf] = rng.uniform() + 0.01;
+
+        next_internal += 1;
+    }
+
+    return Tree{
+        .parent = parent_arr,
+        .left = left_arr,
+        .right = right_arr,
+        .branch_length = bl,
+        .names = names_arr,
+        .n_nodes = total_nodes,
+        .n_leaves = n_leaves,
+        .allocator = allocator,
+    };
+}
+
+const Random = @import("util/random.zig").Random;
+
 // --- Tests ---
 
 test "upgma: 3 sequences with known distances" {
@@ -900,4 +1016,32 @@ test "compare: round-trip Newick preserves topology" {
     var t2 = try readNewick(allocator, buf.items);
     defer t2.deinit();
     try std.testing.expect(t1.compare(t2, 1e-6));
+}
+
+test "simulate: random tree structure is valid" {
+    const allocator = std.testing.allocator;
+    var rng = Random.init(42);
+    var tree = try simulate(allocator, 10, &rng);
+    defer tree.deinit();
+
+    try std.testing.expectEqual(@as(usize, 10), tree.n_leaves);
+    try std.testing.expectEqual(@as(usize, 19), tree.n_nodes);
+    try std.testing.expect(tree.validate());
+}
+
+test "simulate: minimum 2 leaves" {
+    const allocator = std.testing.allocator;
+    var rng = Random.init(1);
+    var tree = try simulate(allocator, 2, &rng);
+    defer tree.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), tree.n_leaves);
+    try std.testing.expectEqual(@as(usize, 3), tree.n_nodes);
+    try std.testing.expect(tree.validate());
+}
+
+test "simulate: error on fewer than 2 leaves" {
+    var rng = Random.init(1);
+    try std.testing.expectError(error.InvalidInput, simulate(std.testing.allocator, 1, &rng));
+    try std.testing.expectError(error.InvalidInput, simulate(std.testing.allocator, 0, &rng));
 }

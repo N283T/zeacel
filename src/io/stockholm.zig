@@ -482,6 +482,16 @@ pub fn write(dest: std.io.AnyWriter, m: Msa) !void {
     try dest.writeAll("//\n");
 }
 
+/// Write an Msa in Pfam format (single-block Stockholm).
+/// Pfam is identical to Stockholm except the entire alignment is guaranteed
+/// to be in a single block (one line per sequence, no interleaving).
+/// This is the format used by Pfam-A.full and Pfam-A.seed files.
+pub fn writePfam(dest: std.io.AnyWriter, m: Msa) !void {
+    // Pfam is structurally identical to Stockholm in single-block layout,
+    // and our write() already produces single-block output.
+    try write(dest, m);
+}
+
 // --- Helpers ---
 
 fn gfMarkupHasTag(entries: []const GfEntry, tag: []const u8) bool {
