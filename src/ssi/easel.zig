@@ -207,6 +207,49 @@ pub const EaselIndex = struct {
         return null;
     }
 
+    /// Look up by ordinal position (0-indexed).
+    /// Caller owns the returned SsiEntry.name and must free it.
+    pub fn findNumber(self: *EaselIndex, allocator: Allocator, number: u64) !?SsiEntry {
+        if (number >= self.nprimary) return null;
+
+        const endian: std.builtin.Endian = if (self.byteswap) .little else .big;
+
+        // Read the full primary key record.
+        const rec_buf = try allocator.alloc(u8, self.precsize);
+        defer allocator.free(rec_buf);
+
+        const offset = self.poffset + @as(u64, self.precsize) * number;
+        const n = try self.file.preadAll(rec_buf, offset);
+        if (n != self.precsize) return error.InvalidFormat;
+
+        // Parse key name (null-padded C string).
+        var name_len: usize = 0;
+        for (rec_buf[0..self.plen]) |c| {
+            if (c == 0) break;
+            name_len += 1;
+        }
+        const name = try allocator.dupe(u8, rec_buf[0..name_len]);
+        errdefer allocator.free(name);
+
+        // Parse remaining fields after the key.
+        var pos: usize = self.plen;
+        const fnum = readIntFromBuf(u16, rec_buf[pos..], endian);
+        pos += 2;
+        const r_off = readOffsetFromBuf(rec_buf[pos..], self.offsz, endian);
+        pos += self.offsz;
+        const d_off = readOffsetFromBuf(rec_buf[pos..], self.offsz, endian);
+        pos += self.offsz;
+        const len_raw = readIntFromBuf(i64, rec_buf[pos..], endian);
+
+        return SsiEntry{
+            .name = name,
+            .offset = r_off,
+            .data_offset = d_off,
+            .seq_len = if (len_raw >= 0) @intCast(len_raw) else 0,
+            .file_id = fnum,
+        };
+    }
+
     /// Binary search the primary key section for the given key.
     /// Returns an SsiEntry (caller owns entry.name) or null.
     fn binarySearchPrimary(self: *EaselIndex, allocator: Allocator, key: []const u8) !?SsiEntry {
@@ -761,4 +804,41 @@ test "EaselIndex.lookup: finds secondary key and resolves to primary" {
         const result = try idx.lookup(allocator, "acc3");
         try std.testing.expect(result == null);
     }
+}
+
+test "EaselIndex.findNumber: ordinal access" {
+    const allocator = std.testing.allocator;
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+
+    try writeEaselHeader(&buf, allocator, .{ .nprimary = 3 });
+
+    try writePrimaryKey(&buf, allocator, .{ .key = "alpha", .r_off = 0, .d_off = 10, .len = 100 });
+    try writePrimaryKey(&buf, allocator, .{ .key = "beta", .r_off = 200, .d_off = 210, .len = 50 });
+    try writePrimaryKey(&buf, allocator, .{ .key = "gamma", .r_off = 400, .d_off = 410, .len = 75 });
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.ssi", .data = buf.items });
+
+    const file = try tmp_dir.dir.openFile("test.ssi", .{});
+    var idx = try EaselIndex.read(allocator, file);
+    defer idx.deinit();
+
+    const e0 = (try idx.findNumber(allocator, 0)) orelse return error.ExpectedEntry;
+    defer allocator.free(e0.name);
+    try std.testing.expectEqualStrings("alpha", e0.name);
+    try std.testing.expectEqual(@as(u64, 0), e0.offset);
+    try std.testing.expectEqual(@as(u64, 10), e0.data_offset);
+    try std.testing.expectEqual(@as(u64, 100), e0.seq_len);
+
+    const e2 = (try idx.findNumber(allocator, 2)) orelse return error.ExpectedEntry;
+    defer allocator.free(e2.name);
+    try std.testing.expectEqualStrings("gamma", e2.name);
+    try std.testing.expectEqual(@as(u64, 400), e2.offset);
+
+    // Out of range
+    const missing = try idx.findNumber(allocator, 3);
+    try std.testing.expect(missing == null);
 }
