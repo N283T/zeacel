@@ -31,6 +31,9 @@ pub const Writer = struct {
             .stockholm => try fasta.write(self.dest, seq, self.line_width),
             .genbank => try genbank.writeGenBank(self.dest, seq),
             .embl => try genbank.writeEmbl(self.dest, seq),
+            // For alignment formats, fall back to FASTA per-sequence output.
+            .clustal => try fasta.write(self.dest, seq, self.line_width),
+            .afa => try fasta.write(self.dest, seq, self.line_width),
         }
     }
 

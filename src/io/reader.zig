@@ -7,12 +7,19 @@ const Sequence = @import("../sequence.zig").Sequence;
 const fasta = @import("fasta.zig");
 const stockholm = @import("stockholm.zig");
 const genbank = @import("genbank.zig");
+const clustal = @import("clustal.zig");
 
 pub const Format = enum {
     fasta,
     stockholm,
     genbank,
     embl,
+    /// Clustal alignment format (CLUSTAL W / CLUSTAL OMEGA).
+    clustal,
+    /// Aligned FASTA — syntactically identical to FASTA but all sequences
+    /// have the same length including gap columns. Cannot be auto-detected;
+    /// must be specified explicitly.
+    afa,
 
     /// Detect format from the first non-whitespace bytes of data.
     pub fn detect(header: []const u8) ?Format {
@@ -27,6 +34,7 @@ pub const Format = enum {
         if (std.mem.startsWith(u8, rest, "LOCUS")) return .genbank;
         // EMBL/UniProt: two-letter tag "ID" followed by exactly 3 spaces
         if (std.mem.startsWith(u8, rest, "ID   ")) return .embl;
+        if (std.mem.startsWith(u8, rest, "CLUSTAL")) return .clustal;
         return null;
     }
 };
@@ -44,6 +52,9 @@ pub const Reader = struct {
     // GenBank/EMBL buffering: all records parsed on first call, then iterated.
     gb_seqs: ?[]Sequence = null,
     gb_idx: usize = 0,
+    // Clustal/AFA buffering: sequences extracted from the MSA on first call.
+    msa_seqs: ?[]Sequence = null,
+    msa_idx: usize = 0,
 
     /// Open a file and create a reader (reads entire file into memory).
     /// If format is null, the format is auto-detected from the file header.
@@ -88,6 +99,8 @@ pub const Reader = struct {
             .stockholm => return try nextStockholm(self),
             .genbank => return try nextGenBank(self),
             .embl => return try nextEmbl(self),
+            .clustal => return try nextClustal(self),
+            .afa => return try nextAfa(self),
         }
     }
 
@@ -185,6 +198,46 @@ pub const Reader = struct {
         return seq;
     }
 
+    fn nextMsaFormat(self: *Reader, comptime parseFn: anytype) !?Sequence {
+        if (self.msa_seqs == null) {
+            var msa = try parseFn(self.allocator, self.abc, self.data);
+            errdefer msa.deinit();
+
+            const n = msa.nseq();
+            const seqs = try self.allocator.alloc(Sequence, n);
+            errdefer self.allocator.free(seqs);
+
+            var done: usize = 0;
+            errdefer for (0..done) |i| seqs[i].deinit();
+
+            for (0..n) |i| {
+                seqs[i] = try msa.extractSeq(i);
+                done += 1;
+            }
+
+            msa.deinit();
+            self.msa_seqs = seqs;
+            self.msa_idx = 0;
+            self.pos = self.data.len;
+        }
+
+        const seqs = self.msa_seqs.?;
+        if (self.msa_idx >= seqs.len) return null;
+
+        const seq = seqs[self.msa_idx];
+        self.msa_idx += 1;
+        return seq;
+    }
+
+    fn nextClustal(self: *Reader) !?Sequence {
+        return self.nextMsaFormat(clustal.parse);
+    }
+
+    fn nextAfa(self: *Reader) !?Sequence {
+        const afa = @import("afa.zig");
+        return self.nextMsaFormat(afa.parse);
+    }
+
     pub fn deinit(self: *Reader) void {
         if (self.stk_seqs) |seqs| {
             // Sequences already returned to caller are not freed here;
@@ -194,6 +247,10 @@ pub const Reader = struct {
         }
         if (self.gb_seqs) |seqs| {
             for (seqs[self.gb_idx..]) |*s| @constCast(s).deinit();
+            self.allocator.free(seqs);
+        }
+        if (self.msa_seqs) |seqs| {
+            for (seqs[self.msa_idx..]) |*s| @constCast(s).deinit();
             self.allocator.free(seqs);
         }
         if (self.owns_data) {
@@ -392,6 +449,71 @@ test "Reader.next: embl auto-detect and iterate" {
     var seq2 = (try reader.next()) orelse return error.ExpectedSequence;
     defer seq2.deinit();
     try std.testing.expectEqualStrings("SEQ2", seq2.name);
+
+    const eof = try reader.next();
+    try std.testing.expectEqual(@as(?Sequence, null), eof);
+}
+
+test "Format.detect: clustal" {
+    try std.testing.expectEqual(@as(?Format, .clustal), Format.detect("CLUSTAL W (1.83) multiple sequence alignment\n"));
+}
+
+test "Reader.next: clustal auto-detect yields ungapped sequences" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\CLUSTAL W (1.83) multiple sequence alignment
+        \\
+        \\seq1      AC-GT
+        \\seq2      ACGGT
+        \\
+        \\
+    ;
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, null);
+    defer reader.deinit();
+
+    try std.testing.expectEqual(Format.clustal, reader.format);
+
+    var seq1 = (try reader.next()) orelse return error.ExpectedSequence;
+    defer seq1.deinit();
+    try std.testing.expectEqualStrings("seq1", seq1.name);
+    // Gaps removed: AC-GT -> ACGT (4 residues).
+    try std.testing.expectEqual(@as(usize, 4), seq1.dsq.len);
+
+    var seq2 = (try reader.next()) orelse return error.ExpectedSequence;
+    defer seq2.deinit();
+    try std.testing.expectEqualStrings("seq2", seq2.name);
+    try std.testing.expectEqual(@as(usize, 5), seq2.dsq.len);
+
+    const eof = try reader.next();
+    try std.testing.expectEqual(@as(?Sequence, null), eof);
+}
+
+test "Reader.next: afa explicit format yields ungapped sequences" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\>seq1
+        \\AC-GT
+        \\>seq2
+        \\ACGGT
+        \\
+    ;
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .afa);
+    defer reader.deinit();
+
+    try std.testing.expectEqual(Format.afa, reader.format);
+
+    var seq1 = (try reader.next()) orelse return error.ExpectedSequence;
+    defer seq1.deinit();
+    try std.testing.expectEqualStrings("seq1", seq1.name);
+    // Gaps removed by extractSeq: AC-GT -> ACGT (4 residues).
+    try std.testing.expectEqual(@as(usize, 4), seq1.dsq.len);
+
+    var seq2 = (try reader.next()) orelse return error.ExpectedSequence;
+    defer seq2.deinit();
+    try std.testing.expectEqualStrings("seq2", seq2.name);
+    try std.testing.expectEqual(@as(usize, 5), seq2.dsq.len);
 
     const eof = try reader.next();
     try std.testing.expectEqual(@as(?Sequence, null), eof);
