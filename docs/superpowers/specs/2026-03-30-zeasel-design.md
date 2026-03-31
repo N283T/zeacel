@@ -1,8 +1,8 @@
-# zeacel — Zig Reimplementation of Easel
+# zeasel — Zig Reimplementation of Easel
 
 ## Overview
 
-zeacel is a Zig reimplementation of [Easel](https://github.com/EddyRivasLab/easel), a C library for biological sequence analysis developed by the Eddy/Rivas laboratory at Harvard. Easel underpins HMMER and Infernal. zeacel serves as the foundation library for a Zig reimplementation of HMMER.
+zeasel is a Zig reimplementation of [Easel](https://github.com/EddyRivasLab/easel), a C library for biological sequence analysis developed by the Eddy/Rivas laboratory at Harvard. Easel underpins HMMER and Infernal. zeasel serves as the foundation library for a Zig reimplementation of HMMER.
 
 **Goals:**
 - Feature parity with Easel, achieved incrementally
@@ -17,7 +17,7 @@ zeacel is a Zig reimplementation of [Easel](https://github.com/EddyRivasLab/ease
 ## Project Structure
 
 ```
-zeacel/
+zeasel/
 ├── build.zig
 ├── build.zig.zon
 ├── src/
@@ -62,7 +62,7 @@ digital ← sequence
 
 ## Key Design Decisions vs Easel
 
-| Aspect | Easel (C) | zeacel (Zig) |
+| Aspect | Easel (C) | zeasel (Zig) |
 |--------|-----------|--------------|
 | Digital sequences | `ESL_DSQ` (uint8_t) + sentinel bytes | `[]u8` slice, no sentinels |
 | Text/Digital mode | Dual-mode coexistence | Digital-only default, text via conversion |

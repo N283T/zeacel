@@ -35,7 +35,7 @@ pub const ScoreMatrix = struct {
 // ---------------------------------------------------------------------------
 // BLOSUM62 data
 //
-// Row/column order matches zeacel's amino alphabet:
+// Row/column order matches zeasel's amino alphabet:
 //   A  C  D  E  F  G  H  I  K  L  M  N  P  Q  R  S  T  V  W  Y
 // ---------------------------------------------------------------------------
 

@@ -1,13 +1,13 @@
-// zeacel-reformat: convert between sequence file formats.
+// zeasel-reformat: convert between sequence file formats.
 // Equivalent to Easel's esl-reformat.
 //
-// Usage: zeacel-reformat <output-format> <input-file>
+// Usage: zeasel-reformat <output-format> <input-file>
 // Where output-format is one of: fasta, genbank, embl
 
 const std = @import("std");
-const zeacel = @import("zeacel");
+const zeasel = @import("zeasel");
 
-fn parseOutputFormat(name: []const u8) ?zeacel.io.Format {
+fn parseOutputFormat(name: []const u8) ?zeasel.io.Format {
     if (std.mem.eql(u8, name, "fasta")) return .fasta;
     if (std.mem.eql(u8, name, "genbank")) return .genbank;
     if (std.mem.eql(u8, name, "embl")) return .embl;
@@ -23,7 +23,7 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 3) {
-        std.debug.print("Usage: zeacel-reformat <output-format> <input-file>\n", .{});
+        std.debug.print("Usage: zeasel-reformat <output-format> <input-file>\n", .{});
         std.debug.print("Output formats: fasta, genbank, embl\n", .{});
         std.process.exit(1);
     }
@@ -44,24 +44,24 @@ pub fn main() !void {
     defer allocator.free(data);
 
     // Detect input format.
-    const in_format = zeacel.io.Format.detect(data) orelse {
+    const in_format = zeasel.io.Format.detect(data) orelse {
         std.debug.print("Error: cannot detect input file format\n", .{});
         std.process.exit(1);
     };
 
     // Guess alphabet from file content.
-    const abc_type = zeacel.alphabet.guessType(data) orelse blk: {
+    const abc_type = zeasel.alphabet.guessType(data) orelse blk: {
         std.debug.print("Warning: could not detect alphabet, defaulting to DNA\n", .{});
         break :blk .dna;
     };
-    const abc: *const zeacel.alphabet.Alphabet = switch (abc_type) {
-        .dna => &zeacel.alphabet.dna,
-        .rna => &zeacel.alphabet.rna,
-        .amino => &zeacel.alphabet.amino,
+    const abc: *const zeasel.alphabet.Alphabet = switch (abc_type) {
+        .dna => &zeasel.alphabet.dna,
+        .rna => &zeasel.alphabet.rna,
+        .amino => &zeasel.alphabet.amino,
     };
 
     // Parse all sequences.
-    var reader = try zeacel.io.Reader.fromMemory(allocator, abc, data, in_format);
+    var reader = try zeasel.io.Reader.fromMemory(allocator, abc, data, in_format);
     defer reader.deinit();
 
     const sequences = try reader.readAll();
@@ -75,6 +75,6 @@ pub fn main() !void {
     // TODO(M1): deprecatedWriter() is deprecated; migrate to stdout_file.writer(buffer)
     // once the codebase adopts the new std.Io.Writer API (requires an explicit buffer).
     const stdout = stdout_file.deprecatedWriter();
-    var writer = zeacel.io.Writer.init(stdout.any(), out_format, 60);
+    var writer = zeasel.io.Writer.init(stdout.any(), out_format, 60);
     try writer.writeAll(sequences);
 }

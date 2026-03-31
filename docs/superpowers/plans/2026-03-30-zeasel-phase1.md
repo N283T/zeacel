@@ -1,8 +1,8 @@
-# zeacel Phase 1: Project Scaffold + Alphabet Module
+# zeasel Phase 1: Project Scaffold + Alphabet Module
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Set up the zeacel Zig project and implement the Alphabet module — the foundational building block for biological sequence digitization.
+**Goal:** Set up the zeasel Zig project and implement the Alphabet module — the foundational building block for biological sequence digitization.
 
 **Architecture:** The Alphabet module encodes biological sequences (DNA, RNA, amino acids) as compact u8 digital codes using comptime-generated lookup tables. Standard alphabets (dna, rna, amino) are fully constructed at compile time with zero runtime allocation. The encoding follows Easel's internal ordering: canonical residues (0..K-1), gap (K), degeneracies (K+1..Kp-4), any (Kp-3), nonresidue (Kp-2), missing (Kp-1).
 
@@ -23,7 +23,7 @@
 
 ```zig
 .{
-    .name = .@"zeacel",
+    .name = .@"zeasel",
     .version = .@"0.1.0",
     .fingerprint = .@"zig-default-fingerprint",
     .minimum_zig_version = .@"0.15.0",
@@ -44,7 +44,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const lib_mod = b.addModule("zeacel", .{
+    const lib_mod = b.addModule("zeasel", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
 
     const lib = b.addLibrary(.{
         .linkage = .static,
-        .name = "zeacel",
+        .name = "zeasel",
         .root_module = lib_mod,
     });
     b.installArtifact(lib);
@@ -77,7 +77,7 @@ This will fail to compile until alphabet.zig exists — that is expected and con
 
 - [ ] **Step 4: Verify build setup compiles (expect failure)**
 
-Run: `cd /Users/nagaet/zeacel && zig build 2>&1`
+Run: `cd /Users/nagaet/zeasel && zig build 2>&1`
 Expected: Compilation error about missing `alphabet.zig`. This confirms `build.zig` wiring is correct.
 
 - [ ] **Step 5: Create empty alphabet.zig to unblock build**
@@ -90,16 +90,16 @@ Create `src/alphabet.zig` with a placeholder:
 
 - [ ] **Step 6: Verify clean build**
 
-Run: `cd /Users/nagaet/zeacel && zig build`
+Run: `cd /Users/nagaet/zeasel && zig build`
 Expected: Success with no errors.
 
 - [ ] **Step 7: Initialize git and commit**
 
 ```bash
-cd /Users/nagaet/zeacel
+cd /Users/nagaet/zeasel
 git init
 git add build.zig build.zig.zon src/root.zig src/alphabet.zig
-git commit -m "chore: initialize zeacel Zig project"
+git commit -m "chore: initialize zeasel Zig project"
 ```
 
 ---
@@ -255,13 +255,13 @@ test "Alphabet classification methods" {
 
 - [ ] **Step 2: Run tests**
 
-Run: `cd /Users/nagaet/zeacel && zig build test`
+Run: `cd /Users/nagaet/zeasel && zig build test`
 Expected: All tests pass.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/nagaet/zeacel
+cd /Users/nagaet/zeasel
 git add src/alphabet.zig
 git commit -m "feat: add Alphabet core types with classification methods"
 ```
@@ -414,13 +414,13 @@ test "DNA alphabet complement" {
 
 - [ ] **Step 2: Run tests**
 
-Run: `cd /Users/nagaet/zeacel && zig build test`
+Run: `cd /Users/nagaet/zeasel && zig build test`
 Expected: All tests pass.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/nagaet/zeacel
+cd /Users/nagaet/zeasel
 git add src/alphabet.zig
 git commit -m "feat: add comptime DNA alphabet with encode/decode/complement"
 ```
@@ -549,13 +549,13 @@ test "Amino acid alphabet degeneracy codes" {
 
 - [ ] **Step 2: Run tests**
 
-Run: `cd /Users/nagaet/zeacel && zig build test`
+Run: `cd /Users/nagaet/zeasel && zig build test`
 Expected: All tests pass.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/nagaet/zeacel
+cd /Users/nagaet/zeasel
 git add src/alphabet.zig
 git commit -m "feat: add RNA and amino acid alphabets"
 ```
@@ -770,13 +770,13 @@ test "reverseComplement degeneracies" {
 
 - [ ] **Step 2: Run tests**
 
-Run: `cd /Users/nagaet/zeacel && zig build test`
+Run: `cd /Users/nagaet/zeasel && zig build test`
 Expected: All tests pass.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/nagaet/zeacel
+cd /Users/nagaet/zeasel
 git add src/alphabet.zig
 git commit -m "feat: add digitize, textize, and reverseComplement"
 ```
@@ -872,13 +872,13 @@ test "guessType gaps only returns null" {
 
 - [ ] **Step 2: Run tests**
 
-Run: `cd /Users/nagaet/zeacel && zig build test`
+Run: `cd /Users/nagaet/zeasel && zig build test`
 Expected: All tests pass.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/nagaet/zeacel
+cd /Users/nagaet/zeasel
 git add src/alphabet.zig
 git commit -m "feat: add alphabet type guessing from sequence content"
 ```
@@ -892,19 +892,19 @@ git commit -m "feat: add alphabet type guessing from sequence content"
 
 - [ ] **Step 1: Run full test suite**
 
-Run: `cd /Users/nagaet/zeacel && zig build test 2>&1`
+Run: `cd /Users/nagaet/zeasel && zig build test 2>&1`
 Expected: All tests pass with no warnings.
 
 - [ ] **Step 2: Verify library builds as static lib**
 
-Run: `cd /Users/nagaet/zeacel && zig build`
+Run: `cd /Users/nagaet/zeasel && zig build`
 Expected: Successful build, artifact in `zig-out/lib/`.
 
 - [ ] **Step 3: Verify clean git status**
 
-Run: `cd /Users/nagaet/zeacel && git log --oneline && echo "---" && git status`
+Run: `cd /Users/nagaet/zeasel && git log --oneline && echo "---" && git status`
 Expected: Clean working tree with commits:
-1. `chore: initialize zeacel Zig project`
+1. `chore: initialize zeasel Zig project`
 2. `feat: add Alphabet core types with classification methods`
 3. `feat: add comptime DNA alphabet with encode/decode/complement`
 4. `feat: add RNA and amino acid alphabets`

@@ -1,9 +1,9 @@
 // Genetic code and DNA-to-protein translation.
 //
-// Codons are indexed as base1*16 + base2*4 + base3, using the zeacel DNA
+// Codons are indexed as base1*16 + base2*4 + base3, using the zeasel DNA
 // digital encoding: A=0, C=1, G=2, T=3.
 //
-// Amino acid digital codes follow the zeacel amino alphabet:
+// Amino acid digital codes follow the zeasel amino alphabet:
 // A=0 C=1 D=2 E=3 F=4 G=5 H=6 I=7 K=8 L=9 M=10 N=11 P=12 Q=13 R=14 S=15
 // T=16 V=17 W=18 Y=19
 // Stop codon is represented as 255.
@@ -108,7 +108,7 @@ fn codonIndex(b1: u8, b2: u8, b3: u8) usize {
 /// Build a comptime ASCII-to-amino-digital-code map.
 /// Non-amino characters map to 255.
 fn buildAaMap() [128]u8 {
-    // zeacel amino alphabet canonical symbols in order:
+    // zeasel amino alphabet canonical symbols in order:
     const amino_symbols = "ACDEFGHIKLMNPQRSTVWY";
     var map: [128]u8 = .{255} ** 128;
     for (amino_symbols, 0..) |c, i| {
@@ -117,7 +117,7 @@ fn buildAaMap() [128]u8 {
     return map;
 }
 
-/// Map a DNA base ASCII character (A/C/G/T) to its zeacel digital code.
+/// Map a DNA base ASCII character (A/C/G/T) to its zeasel digital code.
 fn baseCharToDigital(c: u8) u8 {
     return switch (c) {
         'A' => 0,

@@ -1,10 +1,10 @@
-// zeacel-seqstat: report statistics about sequences in a file.
+// zeasel-seqstat: report statistics about sequences in a file.
 // Equivalent to Easel's esl-seqstat.
 //
-// Usage: zeacel-seqstat <seqfile>
+// Usage: zeasel-seqstat <seqfile>
 
 const std = @import("std");
-const zeacel = @import("zeacel");
+const zeasel = @import("zeasel");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -15,7 +15,7 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 2) {
-        std.debug.print("Usage: zeacel-seqstat <seqfile>\n", .{});
+        std.debug.print("Usage: zeasel-seqstat <seqfile>\n", .{});
         std.process.exit(1);
     }
 
@@ -28,24 +28,24 @@ pub fn main() !void {
     defer allocator.free(data);
 
     // Detect format.
-    const format = zeacel.io.Format.detect(data) orelse {
+    const format = zeasel.io.Format.detect(data) orelse {
         std.debug.print("Error: cannot detect file format\n", .{});
         std.process.exit(1);
     };
 
     // Guess alphabet from file content.
-    const abc_type = zeacel.alphabet.guessType(data) orelse blk: {
+    const abc_type = zeasel.alphabet.guessType(data) orelse blk: {
         std.debug.print("Warning: could not detect alphabet, defaulting to DNA\n", .{});
         break :blk .dna;
     };
-    const abc: *const zeacel.alphabet.Alphabet = switch (abc_type) {
-        .dna => &zeacel.alphabet.dna,
-        .rna => &zeacel.alphabet.rna,
-        .amino => &zeacel.alphabet.amino,
+    const abc: *const zeasel.alphabet.Alphabet = switch (abc_type) {
+        .dna => &zeasel.alphabet.dna,
+        .rna => &zeasel.alphabet.rna,
+        .amino => &zeasel.alphabet.amino,
     };
 
     // Parse all sequences using the unified Reader.
-    var reader = try zeacel.io.Reader.fromMemory(allocator, abc, data, format);
+    var reader = try zeasel.io.Reader.fromMemory(allocator, abc, data, format);
     defer reader.deinit();
 
     const sequences = try reader.readAll();
