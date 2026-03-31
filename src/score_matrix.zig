@@ -108,7 +108,15 @@ pub const ScoreMatrix = struct {
     /// Compute relative entropy H = sum_ij p_ij * log2(p_ij / (f_i * f_j))
     /// given background frequencies, where p_ij = f_i * f_j * exp(lambda * s_ij).
     /// Returns the relative entropy in bits.
-    pub fn relativeEntropy(self: ScoreMatrix, bg: *const [20]f64, lambda: f64) f64 {
+    /// Returns error.InvalidProbabilities if the background frequencies do not
+    /// sum to approximately 1.0.
+    pub fn relativeEntropy(self: ScoreMatrix, bg: *const [20]f64, lambda: f64) !f64 {
+        // Validate that background probabilities sum to ~1.0
+        var bg_sum: f64 = 0;
+        for (bg) |p| bg_sum += p;
+        if (@abs(bg_sum - 1.0) > 1e-6) return error.InvalidProbabilities;
+
+        // First compute the normalizing constant Z = sum_ij f_i * f_j * exp(lambda * s_ij)
         var z: f64 = 0;
         for (0..20) |i| {
             for (0..20) |j| {
@@ -833,4 +841,15 @@ test "write: round-trip" {
             try std.testing.expectEqual(blosum62.data[i][j], sm.data[i][j]);
         }
     }
+}
+
+test "relativeEntropy: BLOSUM62 is positive" {
+    const h = try blosum62.relativeEntropy(&composition.bl62, 0.3466);
+    try std.testing.expect(h > 0);
+}
+
+test "relativeEntropy: invalid probabilities" {
+    var bad_bg: [20]f64 = undefined;
+    for (&bad_bg) |*v| v.* = 0.1; // sums to 2.0
+    try std.testing.expectError(error.InvalidProbabilities, blosum62.relativeEntropy(&bad_bg, 0.3466));
 }

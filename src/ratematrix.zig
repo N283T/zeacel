@@ -54,7 +54,7 @@ pub fn normalize(q: *Matrix, pi: []const f64) void {
 
 /// Compute the probability matrix P(t) = exp(tQ).
 /// Caller owns the returned Matrix.
-pub fn probMatrix(_: Allocator, q: Matrix, t: f64) !Matrix {
+pub fn probMatrix(q: Matrix, t: f64) !Matrix {
     return q.exp(t);
 }
 
@@ -308,7 +308,7 @@ test "probMatrix: P(0) = I" {
     q.set(1, 0, 1.0);
     q.set(1, 1, -1.0);
 
-    var p = try probMatrix(allocator, q, 0.0);
+    var p = try probMatrix(q, 0.0);
     defer p.deinit();
 
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), p.get(0, 0), 1e-10);
@@ -329,7 +329,7 @@ test "probMatrix: rows sum to 1" {
     q.set(2, 1, 1.0);
     q.set(2, 2, -2.0);
 
-    var p = try probMatrix(allocator, q, 0.5);
+    var p = try probMatrix(q, 0.5);
     defer p.deinit();
 
     for (0..3) |i| {
@@ -450,7 +450,7 @@ test "validateP: P(t) from rate matrix is valid" {
     const allocator = std.testing.allocator;
     var q = try setJukesCantor(allocator, 4);
     defer q.deinit();
-    var p = try probMatrix(allocator, q, 0.5);
+    var p = try probMatrix(q, 0.5);
     defer p.deinit();
     try std.testing.expect(validateP(p, 1e-8));
 }
@@ -503,7 +503,7 @@ test "expectedScore: matches relativeEntropy" {
     const allocator = std.testing.allocator;
     var q = try setJukesCantor(allocator, 4);
     defer q.deinit();
-    var p = try probMatrix(allocator, q, 0.1);
+    var p = try probMatrix(q, 0.1);
     defer p.deinit();
     const pi = [_]f64{ 0.25, 0.25, 0.25, 0.25 };
     try std.testing.expectApproxEqAbs(

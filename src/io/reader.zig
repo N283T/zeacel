@@ -38,6 +38,10 @@ pub const Format = enum {
     /// DDBJ format — uses the same GenBank parser.
     /// Cannot be auto-detected separately; must be specified explicitly.
     ddbj,
+    /// Pfam format — Stockholm in guaranteed single-block layout (one line per
+    /// sequence). Reading is identical to Stockholm; writing omits interleaving.
+    /// Cannot be auto-detected separately; must be specified explicitly.
+    pfam,
 
     /// Detect format from the first non-whitespace bytes of data.
     pub fn detect(header: []const u8) ?Format {
@@ -146,6 +150,7 @@ pub const Reader = struct {
             .psiblast => return try nextPsiblast(self),
             .selex => return try nextSelex(self),
             .ddbj => return try nextGenBank(self),
+            .pfam => return try nextStockholm(self),
         }
     }
 
@@ -606,4 +611,26 @@ test "Reader.next: ddbj format uses genbank parser" {
 
     const eof_ddbj = try reader.next();
     try std.testing.expectEqual(@as(?Sequence, null), eof_ddbj);
+}
+
+test "Reader.next: pfam format reads as stockholm" {
+    const allocator = std.testing.allocator;
+    const data = "# STOCKHOLM 1.0\n\nseq1  ACGT\nseq2  TTTT\n//\n";
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .pfam);
+    defer reader.deinit();
+
+    try std.testing.expectEqual(Format.pfam, reader.format);
+
+    var seq1 = (try reader.next()) orelse return error.ExpectedSequence;
+    defer seq1.deinit();
+    try std.testing.expectEqualStrings("seq1", seq1.name);
+    try std.testing.expectEqual(@as(usize, 4), seq1.dsq.len);
+
+    var seq2 = (try reader.next()) orelse return error.ExpectedSequence;
+    defer seq2.deinit();
+    try std.testing.expectEqualStrings("seq2", seq2.name);
+
+    const eof = try reader.next();
+    try std.testing.expectEqual(@as(?Sequence, null), eof);
 }

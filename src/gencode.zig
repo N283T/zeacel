@@ -149,6 +149,43 @@ pub const GeneticCode = struct {
         }
         return frames;
     }
+
+    /// Write the translation table in a human-readable format showing
+    /// codon -> amino acid mappings, grouped by first base.
+    /// Example output line: "  AAA -> K (Lys)"
+    pub fn writeTable(self: GeneticCode, dest: std.io.AnyWriter) !void {
+        const bases = "ACGT";
+        const amino_symbols = "ACDEFGHIKLMNPQRSTVWY";
+        // Three-letter amino acid names indexed by digital code (0..19).
+        const amino_names = [20][]const u8{
+            "Ala", "Cys", "Asp", "Glu", "Phe", "Gly", "His", "Ile", "Lys", "Leu",
+            "Met", "Asn", "Pro", "Gln", "Arg", "Ser", "Thr", "Val", "Trp", "Tyr",
+        };
+
+        try dest.print("# Genetic Code: {s} (ID {d})\n", .{ self.name, self.id });
+
+        for (0..4) |b1| {
+            for (0..4) |b2| {
+                for (0..4) |b3| {
+                    const idx = b1 * 16 + b2 * 4 + b3;
+                    const aa = self.codon_table[idx];
+                    const start_marker: u8 = if (self.is_start[idx]) 'i' else ' ';
+                    if (aa == STOP_CODON) {
+                        try dest.print("  {c}{c}{c} -> *   (Stop){c}\n", .{
+                            bases[b1], bases[b2], bases[b3], start_marker,
+                        });
+                    } else {
+                        try dest.print("  {c}{c}{c} -> {c}   ({s}){c}\n", .{
+                            bases[b1], bases[b2], bases[b3],
+                            amino_symbols[aa],
+                            amino_names[aa],
+                            start_marker,
+                        });
+                    }
+                }
+            }
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -566,4 +603,25 @@ test "translateAmbiguous with stop codons" {
     // TAY (Y=C|T): TAC=Y(19), TAT=Y(19) -> Y
     const tyr = standard.translateAmbiguous(abc, 3, 0, 6); // TA + Y
     try std.testing.expectEqual(@as(?u8, 19), tyr);
+}
+
+test "writeTable: produces 64 codon lines" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+    try standard.writeTable(buf.writer(allocator).any());
+
+    // Count lines starting with "  " (codon lines)
+    var codon_lines: usize = 0;
+    var lines = std.mem.splitScalar(u8, buf.items, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "  ")) codon_lines += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 64), codon_lines);
+
+    // Should contain the header with the code name
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "Standard") != null);
+
+    // Should contain ATG -> M mapping
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "ATG -> M") != null);
 }
