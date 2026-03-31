@@ -55,6 +55,34 @@ pub const Recorder = struct {
         return self.lines.items.len;
     }
 
+    /// Append a line to the recorder (stream integration for look-ahead buffering).
+    /// The line is copied; the caller retains ownership of the input slice.
+    /// Modelled after Easel's esl_recorder_Read + manual append pattern.
+    pub fn addLine(self: *Recorder, allocator: Allocator, line: []const u8) !void {
+        const copy = try allocator.dupe(u8, line);
+        try self.lines.append(allocator, copy);
+    }
+
+    /// Mark the current end-of-recording position as the start of a block.
+    /// Returns the position marker that can later be passed to getBlock().
+    /// Modelled after Easel's esl_recorder_MarkBlock().
+    pub fn markBlock(self: Recorder) usize {
+        return self.lines.items.len;
+    }
+
+    /// Return all lines recorded from a previous block marker to the current
+    /// end of the recording.  The returned slice is newly allocated and owned
+    /// by the caller; the individual line slices point into recorder memory
+    /// and must not be freed separately.
+    /// Modelled after Easel's esl_recorder_GetBlock().
+    pub fn getBlock(self: Recorder, allocator: Allocator, block_mark: usize) ![][]const u8 {
+        if (block_mark > self.lines.items.len) return error.InvalidBlockMark;
+        const block_lines = self.lines.items[block_mark..];
+        const result = try allocator.alloc([]const u8, block_lines.len);
+        @memcpy(result, block_lines);
+        return result;
+    }
+
     /// Free all recorded lines and the recorder.
     pub fn deinit(self: *Recorder) void {
         for (self.lines.items) |line| self.allocator.free(line);
@@ -112,4 +140,84 @@ test "mark and rollback" {
     rec.rollback(saved); // back to after A
 
     try std.testing.expectEqualStrings("B", rec.readLine().?);
+}
+
+test "addLine appends to recording" {
+    const allocator = std.testing.allocator;
+    var rec = Recorder.init(allocator);
+    defer rec.deinit();
+
+    try rec.addLine(allocator, "hello");
+    try rec.addLine(allocator, "world");
+
+    try std.testing.expectEqual(@as(usize, 2), rec.lineCount());
+    try std.testing.expectEqualStrings("hello", rec.readLine().?);
+    try std.testing.expectEqualStrings("world", rec.readLine().?);
+}
+
+test "markBlock and getBlock: basic block capture" {
+    const allocator = std.testing.allocator;
+    var rec = Recorder.init(allocator);
+    defer rec.deinit();
+
+    // Simulate reading a header then marking a block of data lines
+    try rec.addLine(allocator, "# header");
+    const block_start = rec.markBlock(); // mark after header
+    try rec.addLine(allocator, "data1");
+    try rec.addLine(allocator, "data2");
+    try rec.addLine(allocator, "data3");
+
+    const block = try rec.getBlock(allocator, block_start);
+    defer allocator.free(block);
+
+    try std.testing.expectEqual(@as(usize, 3), block.len);
+    try std.testing.expectEqualStrings("data1", block[0]);
+    try std.testing.expectEqualStrings("data2", block[1]);
+    try std.testing.expectEqualStrings("data3", block[2]);
+}
+
+test "markBlock and getBlock: empty block" {
+    const allocator = std.testing.allocator;
+    var rec = Recorder.init(allocator);
+    defer rec.deinit();
+
+    const block_start = rec.markBlock();
+    const block = try rec.getBlock(allocator, block_start);
+    defer allocator.free(block);
+
+    try std.testing.expectEqual(@as(usize, 0), block.len);
+}
+
+test "markBlock and getBlock: multiple blocks" {
+    const allocator = std.testing.allocator;
+    var rec = Recorder.init(allocator);
+    defer rec.deinit();
+
+    try rec.addLine(allocator, "A");
+    const mark1 = rec.markBlock();
+    try rec.addLine(allocator, "B");
+    try rec.addLine(allocator, "C");
+    const mark2 = rec.markBlock();
+    try rec.addLine(allocator, "D");
+
+    const block1 = try rec.getBlock(allocator, mark1);
+    defer allocator.free(block1);
+    const block2 = try rec.getBlock(allocator, mark2);
+    defer allocator.free(block2);
+
+    try std.testing.expectEqual(@as(usize, 3), block1.len);
+    try std.testing.expectEqualStrings("B", block1[0]);
+    try std.testing.expectEqualStrings("D", block1[2]);
+
+    try std.testing.expectEqual(@as(usize, 1), block2.len);
+    try std.testing.expectEqualStrings("D", block2[0]);
+}
+
+test "getBlock: invalid mark returns error" {
+    const allocator = std.testing.allocator;
+    var rec = Recorder.init(allocator);
+    defer rec.deinit();
+
+    try rec.addLine(allocator, "only line");
+    try std.testing.expectError(error.InvalidBlockMark, rec.getBlock(allocator, 999));
 }
