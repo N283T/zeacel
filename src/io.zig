@@ -12,6 +12,8 @@ pub const selex = @import("io/selex.zig");
 pub const Reader = @import("io/reader.zig").Reader;
 pub const Writer = @import("io/writer.zig").Writer;
 pub const Format = @import("io/reader.zig").Format;
+pub const WindowReader = @import("io/window_reader.zig").WindowReader;
+pub const WindowResult = @import("io/window_reader.zig").WindowResult;
 
 const reader_mod = @import("io/reader.zig");
 const writer_mod = @import("io/writer.zig");
@@ -33,4 +35,5 @@ test {
     _ = @import("io/a2m.zig");
     _ = @import("io/psiblast.zig");
     _ = @import("io/selex.zig");
+    _ = @import("io/window_reader.zig");
 }
