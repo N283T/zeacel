@@ -204,6 +204,59 @@ pub fn setWAG(allocator: Allocator, pi: ?[]const f64) !Matrix {
     return q;
 }
 
+/// Validate a probability transition matrix P.
+///
+/// Checks that every row sums to 1 (within `tol`) and all elements
+/// are in [0, 1] (within `tol`). Returns true if the matrix passes
+/// all checks.
+pub fn validateP(m: Matrix, tol: f64) bool {
+    if (m.rows != m.cols) return false;
+    const n = m.rows;
+    for (0..n) |i| {
+        var row_sum: f64 = 0;
+        for (0..n) |j| {
+            const v = m.get(i, j);
+            if (v < -tol or v > 1.0 + tol) return false;
+            row_sum += v;
+        }
+        if (@abs(row_sum - 1.0) > tol) return false;
+    }
+    return true;
+}
+
+/// KL divergence of transition matrix P given stationary distribution pi.
+///
+/// D_KL = sum_i pi[i] * sum_j P[i][j] * log(P[i][j] / pi[j])
+///
+/// Terms where P[i][j] == 0 contribute 0 (by convention 0*log(0) = 0).
+pub fn relativeEntropy(p: Matrix, pi: []const f64) f64 {
+    const n = p.rows;
+    std.debug.assert(p.cols == n);
+    std.debug.assert(pi.len == n);
+
+    var dkl: f64 = 0;
+    for (0..n) |i| {
+        for (0..n) |j| {
+            const pij = p.get(i, j);
+            if (pij > 0 and pi[j] > 0) {
+                dkl += pi[i] * pij * @log(pij / pi[j]);
+            }
+        }
+    }
+    return dkl;
+}
+
+/// Expected score per site.
+///
+/// E = sum_i pi[i] * sum_j P[i][j] * log(P[i][j] / pi[j])
+///
+/// This is the same computation as relativeEntropy -- the expected
+/// log-odds score under the model. Provided as a separate name for
+/// clarity in different usage contexts.
+pub fn expectedScore(p: Matrix, pi: []const f64) f64 {
+    return relativeEntropy(p, pi);
+}
+
 // --- Tests ---
 
 test "fromExchangeability: 2x2" {
@@ -384,6 +437,80 @@ test "setWAG: detailed balance" {
             }
         }
     }
+}
+
+test "validateP: identity matrix is valid P" {
+    const allocator = std.testing.allocator;
+    var m = try Matrix.initIdentity(allocator, 4);
+    defer m.deinit();
+    try std.testing.expect(validateP(m, 1e-10));
+}
+
+test "validateP: P(t) from rate matrix is valid" {
+    const allocator = std.testing.allocator;
+    var q = try setJukesCantor(allocator, 4);
+    defer q.deinit();
+    var p = try probMatrix(allocator, q, 0.5);
+    defer p.deinit();
+    try std.testing.expect(validateP(p, 1e-8));
+}
+
+test "validateP: zero matrix is invalid (rows sum to 0, not 1)" {
+    const allocator = std.testing.allocator;
+    var m = try Matrix.init(allocator, 2, 2);
+    defer m.deinit();
+    try std.testing.expect(!validateP(m, 1e-10));
+}
+
+test "validateP: negative elements are invalid" {
+    const allocator = std.testing.allocator;
+    var m = try Matrix.init(allocator, 2, 2);
+    defer m.deinit();
+    m.set(0, 0, 1.5);
+    m.set(0, 1, -0.5);
+    m.set(1, 0, 0.5);
+    m.set(1, 1, 0.5);
+    try std.testing.expect(!validateP(m, 1e-10));
+}
+
+test "relativeEntropy: identity P gives entropy of pi" {
+    // If P[i][j] = delta_ij, then D_KL = sum_i pi[i] * log(1/pi[i]) = H(pi).
+    // For uniform pi = 0.25: D_KL = log(4).
+    const allocator = std.testing.allocator;
+    var m = try Matrix.initIdentity(allocator, 4);
+    defer m.deinit();
+    const pi = [_]f64{ 0.25, 0.25, 0.25, 0.25 };
+    const dkl = relativeEntropy(m, &pi);
+    try std.testing.expectApproxEqAbs(@log(4.0), dkl, 1e-10);
+}
+
+test "relativeEntropy: uniform P gives 0" {
+    // If P[i][j] = pi[j] for all i, then log(P[i][j]/pi[j]) = 0.
+    const allocator = std.testing.allocator;
+    var m = try Matrix.init(allocator, 3, 3);
+    defer m.deinit();
+    const pi = [_]f64{ 0.2, 0.3, 0.5 };
+    for (0..3) |i| {
+        for (0..3) |j| {
+            m.set(i, j, pi[j]);
+        }
+    }
+    const dkl = relativeEntropy(m, &pi);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), dkl, 1e-10);
+}
+
+test "expectedScore: matches relativeEntropy" {
+    const allocator = std.testing.allocator;
+    var q = try setJukesCantor(allocator, 4);
+    defer q.deinit();
+    var p = try probMatrix(allocator, q, 0.1);
+    defer p.deinit();
+    const pi = [_]f64{ 0.25, 0.25, 0.25, 0.25 };
+    try std.testing.expectApproxEqAbs(
+        relativeEntropy(p, &pi),
+        expectedScore(p, &pi),
+        1e-15,
+    );
 }
 
 test "setWAG: custom uniform frequencies give symmetric Q" {

@@ -5,6 +5,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const math = std.math;
+const Random = @import("../util/random.zig").Random;
 
 // ---------------------------------------------------------------------------
 // Dirichlet
@@ -140,6 +141,112 @@ pub const MixtureDirichlet = struct {
         return result;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Sampling
+// ---------------------------------------------------------------------------
+
+/// Uniform random float in (0, 1), excluding 0.
+fn uniformPositive(rng: *Random) f64 {
+    var x: f64 = 0.0;
+    while (x == 0.0) {
+        x = rng.uniform();
+    }
+    return x;
+}
+
+/// Gamma-distributed random deviate with shape `a` and scale 1.
+/// Uses product-of-uniforms for small integer a, Ahrens-Dieter for a >= 3,
+/// and Knuth's method for fractional parts.
+fn gammaRandom(rng: *Random, a: f64) f64 {
+    std.debug.assert(a > 0.0);
+
+    const aint = @floor(a);
+    if (a == aint and a < 12.0) {
+        return gammaInteger(rng, @intFromFloat(a));
+    } else if (a > 3.0) {
+        return gammaAhrens(rng, a);
+    } else if (a < 1.0) {
+        return gammaFraction(rng, a);
+    } else {
+        return gammaInteger(rng, @intFromFloat(aint)) + gammaFraction(rng, a - aint);
+    }
+}
+
+fn gammaInteger(rng: *Random, a: u32) f64 {
+    var u: f64 = 1.0;
+    for (0..a) |_| {
+        u *= uniformPositive(rng);
+    }
+    return -@log(u);
+}
+
+fn gammaAhrens(rng: *Random, a: f64) f64 {
+    while (true) {
+        var y: f64 = undefined;
+        var x: f64 = undefined;
+        while (true) {
+            y = @tan(math.pi * rng.uniform());
+            x = y * @sqrt(2.0 * a - 1.0) + a - 1.0;
+            if (x > 0.0) break;
+        }
+        const v = rng.uniform();
+        const test_val = (1.0 + y * y) * @exp((a - 1.0) * @log(x / (a - 1.0)) - y * @sqrt(2.0 * a - 1.0));
+        if (v <= test_val) return x;
+    }
+}
+
+fn gammaFraction(rng: *Random, a: f64) f64 {
+    const p = math.e / (a + math.e);
+    while (true) {
+        const u = rng.uniform();
+        const v = uniformPositive(rng);
+        var x: f64 = undefined;
+        var q: f64 = undefined;
+        if (u < p) {
+            x = math.pow(f64, v, 1.0 / a);
+            q = @exp(-x);
+        } else {
+            x = 1.0 - @log(v);
+            q = math.pow(f64, x, a - 1.0);
+        }
+        const uu = rng.uniform();
+        if (uu < q) return x;
+    }
+}
+
+/// Sample a probability vector from a Dirichlet distribution.
+///
+/// Each component is sampled from Gamma(alpha[i], 1), then the vector
+/// is normalized to sum to 1. Caller owns the returned slice.
+pub fn sample(allocator: Allocator, rng: *Random, alpha: []const f64) ![]f64 {
+    const k = alpha.len;
+    const result = try allocator.alloc(f64, k);
+    errdefer allocator.free(result);
+
+    var total: f64 = 0;
+    for (0..k) |i| {
+        const g = gammaRandom(rng, alpha[i]);
+        result[i] = g;
+        total += g;
+    }
+    if (total > 0) {
+        for (result) |*r| r.* /= total;
+    }
+    return result;
+}
+
+/// Sample from a symmetric Dirichlet(1,1,...,1) distribution -- uniform
+/// over the probability simplex.
+///
+/// Equivalent to `sample(allocator, rng, &[1,1,...,1])` with k ones.
+/// Caller owns the returned slice.
+pub fn sampleUniform(allocator: Allocator, rng: *Random, k: usize) ![]f64 {
+    const ones = try allocator.alloc(f64, k);
+    defer allocator.free(ones);
+    @memset(ones, 1.0);
+    return sample(allocator, rng, ones);
+}
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -281,6 +388,59 @@ test "MixtureDirichlet posteriorMean: two components, skewed counts select compo
         defer allocator.free(result);
         try std.testing.expect(result[3] > result[0]);
     }
+}
+
+test "sample: output sums to 1 and all elements non-negative" {
+    const allocator = std.testing.allocator;
+    var rng = Random.init(42);
+    const alpha = [_]f64{ 2.0, 3.0, 1.0, 0.5 };
+
+    const p = try sample(allocator, &rng, &alpha);
+    defer allocator.free(p);
+
+    var total: f64 = 0;
+    for (p) |v| {
+        try std.testing.expect(v >= 0.0);
+        total += v;
+    }
+    try std.testing.expect(math.approxEqAbs(f64, total, 1.0, 1e-10));
+}
+
+test "sample: mean converges to alpha/sum(alpha)" {
+    const allocator = std.testing.allocator;
+    var rng = Random.init(12345);
+    const alpha = [_]f64{ 2.0, 5.0, 3.0 };
+    const sum_alpha: f64 = 10.0;
+
+    var mean = [_]f64{ 0.0, 0.0, 0.0 };
+    const n: usize = 2000;
+    for (0..n) |_| {
+        const p = try sample(allocator, &rng, &alpha);
+        defer allocator.free(p);
+        for (0..3) |i| mean[i] += p[i];
+    }
+    const fn_: f64 = @floatFromInt(n);
+    for (0..3) |i| {
+        mean[i] /= fn_;
+        const expected = alpha[i] / sum_alpha;
+        try std.testing.expect(math.approxEqAbs(f64, mean[i], expected, 0.05));
+    }
+}
+
+test "sampleUniform: output sums to 1 with k components" {
+    const allocator = std.testing.allocator;
+    var rng = Random.init(99);
+
+    const p = try sampleUniform(allocator, &rng, 6);
+    defer allocator.free(p);
+
+    try std.testing.expectEqual(@as(usize, 6), p.len);
+    var total: f64 = 0;
+    for (p) |v| {
+        try std.testing.expect(v >= 0.0);
+        total += v;
+    }
+    try std.testing.expect(math.approxEqAbs(f64, total, 1.0, 1e-10));
 }
 
 test "MixtureDirichlet posteriorMean: probabilities sum to 1" {
