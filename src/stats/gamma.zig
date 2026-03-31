@@ -192,9 +192,82 @@ pub fn logSurv(x: f64, mu: f64, lambda: f64, a: f64) f64 {
     return math.log1p(-p);
 }
 
+/// Inverse CDF (quantile function) of the Gamma distribution.
+///
+/// Given a cumulative probability p in (0,1), returns x such that
+/// CDF(x; mu, lambda, a) = p.
+///
+/// Uses bisection on the CDF. The initial bracket is based on the
+/// distribution mean +/- several standard deviations. Returns error
+/// if bisection does not converge within the iteration limit.
+pub fn invcdf(p: f64, mu: f64, lambda: f64, a: f64) !f64 {
+    std.debug.assert(p > 0.0 and p < 1.0);
+    std.debug.assert(lambda > 0.0);
+    std.debug.assert(a > 0.0);
+
+    // Mean and std dev of Gamma(a, lambda) shifted by mu.
+    const mean = mu + a / lambda;
+    const sd = @sqrt(a) / lambda;
+
+    // Initial bracket: expand until CDF(lo) < p and CDF(hi) > p.
+    var lo = mean - 5.0 * sd;
+    if (lo <= mu) lo = mu + 1e-15;
+    var hi = mean + 5.0 * sd;
+
+    // Widen bracket if needed.
+    while (cdf(lo, mu, lambda, a) > p) {
+        lo = mu + (lo - mu) * 0.5;
+        if (lo <= mu) {
+            lo = mu + 1e-15;
+            break;
+        }
+    }
+    while (cdf(hi, mu, lambda, a) < p) {
+        hi = hi + 5.0 * sd;
+    }
+
+    // Bisection.
+    const max_iter: usize = 200;
+    for (0..max_iter) |_| {
+        const mid = 0.5 * (lo + hi);
+        if (hi - lo < 1e-12 * @abs(mid) + 1e-15) return mid;
+
+        const f_mid = cdf(mid, mu, lambda, a);
+        if (f_mid < p) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    return 0.5 * (lo + hi);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "invcdf: round-trip with CDF" {
+    // For several quantiles, verify invcdf(cdf(x)) ~ x.
+    const ps = [_]f64{ 0.1, 0.25, 0.5, 0.75, 0.9, 0.99 };
+    for (ps) |p| {
+        const x = try invcdf(p, 0.0, 1.0, 2.0);
+        const recovered_p = cdf(x, 0.0, 1.0, 2.0);
+        try std.testing.expect(math.approxEqAbs(f64, recovered_p, p, 1e-8));
+    }
+}
+
+test "invcdf: shifted gamma (mu != 0)" {
+    const x = try invcdf(0.5, 5.0, 2.0, 3.0);
+    const recovered_p = cdf(x, 5.0, 2.0, 3.0);
+    try std.testing.expect(math.approxEqAbs(f64, recovered_p, 0.5, 1e-8));
+}
+
+test "invcdf: exponential special case (alpha=1)" {
+    // CDF of Exp(lambda=1) at x is 1 - exp(-x), so median = ln(2).
+    const x = try invcdf(0.5, 0.0, 1.0, 1.0);
+    try std.testing.expect(math.approxEqAbs(f64, x, @log(2.0), 1e-8));
+}
 
 test "incompleteGamma(1, 1) = 1 - exp(-1)" {
     // P(1, x) = 1 - exp(-x)
