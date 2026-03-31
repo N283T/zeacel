@@ -321,6 +321,144 @@ pub const Matrix = struct {
 
         return result;
     }
+
+    /// Result type for eigenvalue decomposition.
+    pub const EigenResult = struct {
+        eigenvalues_re: []f64,
+        eigenvalues_im: []f64,
+        eigenvectors: Matrix,
+        allocator: Allocator,
+
+        pub fn deinit(self: *EigenResult) void {
+            self.allocator.free(self.eigenvalues_re);
+            self.allocator.free(self.eigenvalues_im);
+            self.eigenvectors.deinit();
+        }
+    };
+
+    /// Eigenvalue decomposition for a square symmetric matrix using the
+    /// classical Jacobi eigenvalue algorithm.
+    ///
+    /// The Jacobi method iteratively applies Givens rotations to zero
+    /// off-diagonal elements until the matrix is approximately diagonal.
+    /// It is robust and well-suited for the small dense matrices (4x4,
+    /// 20x20) typical in biological sequence analysis (rate matrices).
+    ///
+    /// The matrix must be symmetric; returns error.NotSymmetric otherwise.
+    /// Returns eigenvalues (all real for symmetric matrices, so
+    /// eigenvalues_im is all zeros) and the orthogonal eigenvector matrix V
+    /// such that A = V * diag(eigenvalues) * V^T.
+    ///
+    /// Modelled after Easel's esl_dmx_Diagonalize (which wraps LAPACK dgeev),
+    /// but uses a pure-Zig Jacobi implementation instead of requiring LAPACK.
+    pub fn diagonalize(self: Matrix, allocator: Allocator) !EigenResult {
+        if (self.rows != self.cols) return error.DimensionMismatch;
+        if (!self.isSymmetric(1e-12)) return error.NotSymmetric;
+        const n = self.rows;
+
+        // Work on a copy that will converge to a diagonal matrix
+        var a = try self.clone();
+        defer a.deinit();
+
+        // V accumulates the product of all Givens rotations (starts as identity)
+        var v = try Matrix.initIdentity(allocator, n);
+        errdefer v.deinit();
+
+        const max_iterations: usize = 100 * n * n;
+        var iteration: usize = 0;
+
+        while (iteration < max_iterations) : (iteration += 1) {
+            // Find the largest off-diagonal element
+            var max_off: f64 = 0.0;
+            var p: usize = 0;
+            var q: usize = 1;
+            for (0..n) |i| {
+                for (i + 1..n) |j| {
+                    const aij = @abs(a.get(i, j));
+                    if (aij > max_off) {
+                        max_off = aij;
+                        p = i;
+                        q = j;
+                    }
+                }
+            }
+
+            // Convergence check: off-diagonal elements are negligible
+            if (max_off < 1e-15) break;
+
+            // Compute the Jacobi rotation angle
+            const app = a.get(p, p);
+            const aqq = a.get(q, q);
+            const apq = a.get(p, q);
+
+            var cos: f64 = undefined;
+            var sin: f64 = undefined;
+
+            if (@abs(app - aqq) < 1e-15) {
+                // theta = pi/4
+                const inv_sqrt2 = 1.0 / @sqrt(2.0);
+                cos = inv_sqrt2;
+                sin = inv_sqrt2;
+            } else {
+                const tau = (aqq - app) / (2.0 * apq);
+                // t = sign(tau) / (|tau| + sqrt(1 + tau^2))
+                const t_val = if (tau >= 0)
+                    1.0 / (tau + @sqrt(1.0 + tau * tau))
+                else
+                    -1.0 / (-tau + @sqrt(1.0 + tau * tau));
+                cos = 1.0 / @sqrt(1.0 + t_val * t_val);
+                sin = t_val * cos;
+            }
+
+            // Apply rotation to A: A' = G^T * A * G
+            // Update rows/columns p and q
+            for (0..n) |r| {
+                if (r == p or r == q) continue;
+                const arp = a.get(r, p);
+                const arq = a.get(r, q);
+                const new_rp = cos * arp - sin * arq;
+                const new_rq = sin * arp + cos * arq;
+                a.set(r, p, new_rp);
+                a.set(p, r, new_rp);
+                a.set(r, q, new_rq);
+                a.set(q, r, new_rq);
+            }
+
+            // Update diagonal and off-diagonal for p,q
+            const new_pp = cos * cos * app - 2.0 * sin * cos * apq + sin * sin * aqq;
+            const new_qq = sin * sin * app + 2.0 * sin * cos * apq + cos * cos * aqq;
+            a.set(p, p, new_pp);
+            a.set(q, q, new_qq);
+            a.set(p, q, 0.0);
+            a.set(q, p, 0.0);
+
+            // Accumulate eigenvectors: V' = V * G
+            for (0..n) |i| {
+                const vip = v.get(i, p);
+                const viq = v.get(i, q);
+                v.set(i, p, cos * vip - sin * viq);
+                v.set(i, q, sin * vip + cos * viq);
+            }
+        }
+
+        // Extract eigenvalues from the diagonal
+        const eigenvalues_re = try allocator.alloc(f64, n);
+        errdefer allocator.free(eigenvalues_re);
+        const eigenvalues_im = try allocator.alloc(f64, n);
+        errdefer allocator.free(eigenvalues_im);
+
+        for (0..n) |i| {
+            eigenvalues_re[i] = a.get(i, i);
+            eigenvalues_im[i] = 0.0;
+        }
+
+        return EigenResult{
+            .eigenvalues_re = eigenvalues_re,
+            .eigenvalues_im = eigenvalues_im,
+            .eigenvectors = v,
+            .allocator = allocator,
+        };
+    }
 };
 
 // --- Tests ---
@@ -605,4 +743,125 @@ test "Matrix.isSymmetric" {
     var rect = try Matrix.init(allocator, 2, 3);
     defer rect.deinit();
     try std.testing.expect(!rect.isSymmetric(1e-10));
+}
+
+test "Matrix.diagonalize: 2x2 symmetric" {
+    const allocator = std.testing.allocator;
+    // A = [[2, 1], [1, 2]]
+    // Eigenvalues: 3 and 1
+    var a = try Matrix.init(allocator, 2, 2);
+    defer a.deinit();
+    a.set(0, 0, 2.0);
+    a.set(0, 1, 1.0);
+    a.set(1, 0, 1.0);
+    a.set(1, 1, 2.0);
+
+    var eigen = try a.diagonalize(allocator);
+    defer eigen.deinit();
+
+    // Sort eigenvalues for deterministic comparison
+    const e0 = @min(eigen.eigenvalues_re[0], eigen.eigenvalues_re[1]);
+    const e1 = @max(eigen.eigenvalues_re[0], eigen.eigenvalues_re[1]);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), e0, 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), e1, 1e-10);
+
+    // Imaginary parts should be zero
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), eigen.eigenvalues_im[0], 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), eigen.eigenvalues_im[1], 1e-10);
+}
+
+test "Matrix.diagonalize: identity" {
+    const allocator = std.testing.allocator;
+    var a = try Matrix.initIdentity(allocator, 3);
+    defer a.deinit();
+
+    var eigen = try a.diagonalize(allocator);
+    defer eigen.deinit();
+
+    for (0..3) |i| {
+        try std.testing.expectApproxEqAbs(@as(f64, 1.0), eigen.eigenvalues_re[i], 1e-10);
+        try std.testing.expectApproxEqAbs(@as(f64, 0.0), eigen.eigenvalues_im[i], 1e-10);
+    }
+}
+
+test "Matrix.diagonalize: V * D * V^T reconstructs A" {
+    const allocator = std.testing.allocator;
+    // 3x3 symmetric matrix
+    var a = try Matrix.init(allocator, 3, 3);
+    defer a.deinit();
+    a.set(0, 0, 4.0);
+    a.set(0, 1, 1.0);
+    a.set(0, 2, 0.5);
+    a.set(1, 0, 1.0);
+    a.set(1, 1, 3.0);
+    a.set(1, 2, 0.25);
+    a.set(2, 0, 0.5);
+    a.set(2, 1, 0.25);
+    a.set(2, 2, 2.0);
+
+    var eigen = try a.diagonalize(allocator);
+    defer eigen.deinit();
+
+    // Reconstruct: A_reconstructed = V * diag(eigenvalues) * V^T
+    var d = try Matrix.init(allocator, 3, 3);
+    defer d.deinit();
+    for (0..3) |i| d.set(i, i, eigen.eigenvalues_re[i]);
+
+    var vd = try Matrix.multiply(allocator, eigen.eigenvectors, d);
+    defer vd.deinit();
+
+    var vt = try eigen.eigenvectors.transpose();
+    defer vt.deinit();
+
+    var reconstructed = try Matrix.multiply(allocator, vd, vt);
+    defer reconstructed.deinit();
+
+    // Check A == V * D * V^T
+    for (0..3) |i| {
+        for (0..3) |j| {
+            try std.testing.expectApproxEqAbs(a.get(i, j), reconstructed.get(i, j), 1e-10);
+        }
+    }
+}
+
+test "Matrix.diagonalize: non-symmetric returns error" {
+    const allocator = std.testing.allocator;
+    var a = try Matrix.init(allocator, 2, 2);
+    defer a.deinit();
+    a.set(0, 0, 1.0);
+    a.set(0, 1, 2.0);
+    a.set(1, 0, 3.0); // asymmetric
+    a.set(1, 1, 4.0);
+
+    try std.testing.expectError(error.NotSymmetric, a.diagonalize(allocator));
+}
+
+test "Matrix.diagonalize: 4x4 rate-matrix-like" {
+    const allocator = std.testing.allocator;
+    // Symmetric 4x4 (typical size for DNA rate matrices after symmetrization)
+    var a = try Matrix.init(allocator, 4, 4);
+    defer a.deinit();
+    const vals = [_]f64{
+        5.0, 1.0, 0.5, 0.2,
+        1.0, 4.0, 0.8, 0.3,
+        0.5, 0.8, 3.0, 0.6,
+        0.2, 0.3, 0.6, 2.0,
+    };
+    for (0..16) |idx| a.data[idx] = vals[idx];
+
+    var eigen = try a.diagonalize(allocator);
+    defer eigen.deinit();
+
+    // Verify orthogonality of eigenvectors: V^T * V = I
+    var vt = try eigen.eigenvectors.transpose();
+    defer vt.deinit();
+    var vtv = try Matrix.multiply(allocator, vt, eigen.eigenvectors);
+    defer vtv.deinit();
+
+    for (0..4) |i| {
+        for (0..4) |j| {
+            const expected: f64 = if (i == j) 1.0 else 0.0;
+            try std.testing.expectApproxEqAbs(expected, vtv.get(i, j), 1e-10);
+        }
+    }
 }
