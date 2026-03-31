@@ -230,6 +230,91 @@ pub fn VectorOps(comptime T: type) type {
             }
             return m + @log(s);
         }
+
+        /// Normalize a log-probability vector: v[i] = v[i] - logSum(v).
+        /// After this, sum(exp(v[i])) = 1.
+        /// Only available for float types.
+        pub fn logNorm(v: []T) void {
+            comptime if (!is_float) @compileError("logNorm requires a float type");
+            if (v.len == 0) return;
+            const denom = logSum(v);
+            const splat: V = @splat(denom);
+            var i: usize = 0;
+            while (i + vec_len <= v.len) : (i += vec_len) {
+                const chunk: V = v[i..][0..vec_len].*;
+                v[i..][0..vec_len].* = chunk - splat;
+            }
+            while (i < v.len) : (i += 1) {
+                v[i] -= denom;
+            }
+        }
+
+        /// Element-wise natural log: dest[i] = ln(src[i]).
+        /// For src[i] <= 0, dest[i] = -inf.
+        /// Only available for float types. Slices must have equal length.
+        pub fn log(dest: []T, src: []const T) void {
+            comptime if (!is_float) @compileError("log requires a float type");
+            std.debug.assert(dest.len == src.len);
+            for (dest, src) |*d, s| {
+                d.* = if (s > 0) @log(s) else -math.inf(T);
+            }
+        }
+
+        /// Element-wise exp: dest[i] = exp(src[i]).
+        /// Only available for float types. Slices must have equal length.
+        pub fn exp(dest: []T, src: []const T) void {
+            comptime if (!is_float) @compileError("exp requires a float type");
+            std.debug.assert(dest.len == src.len);
+            for (dest, src) |*d, s| {
+                d.* = @exp(s);
+            }
+        }
+
+        /// Kullback-Leibler divergence D_KL(p||q) = sum(p[i] * ln(p[i]/q[i])).
+        /// Terms where p[i] == 0 are skipped. Returns inf if any p[i] > 0 and q[i] == 0.
+        /// Only available for float types. Slices must have equal length.
+        pub fn relativeEntropy(p: []const T, q: []const T) T {
+            comptime if (!is_float) @compileError("relativeEntropy requires a float type");
+            std.debug.assert(p.len == q.len);
+            var kl: T = 0;
+            for (p, q) |pi, qi| {
+                if (pi > 0) {
+                    if (qi == 0) return math.inf(T);
+                    kl += pi * @log(pi / qi);
+                }
+            }
+            return kl;
+        }
+
+        /// Sort elements in ascending order (in-place).
+        pub fn sortIncreasing(v: []T) void {
+            std.mem.sort(T, v, {}, std.sort.asc(T));
+        }
+
+        /// Sort elements in descending order (in-place).
+        pub fn sortDecreasing(v: []T) void {
+            std.mem.sort(T, v, {}, std.sort.desc(T));
+        }
+
+        /// Return true if all elements are finite (no NaN, no Inf).
+        /// Only available for float types.
+        pub fn validate(v: []const T) bool {
+            comptime if (!is_float) @compileError("validate requires a float type");
+            for (v) |x| {
+                if (math.isNan(x) or math.isInf(x)) return false;
+            }
+            return true;
+        }
+
+        /// Return true if all elements are <= 0 and finite (valid log-probabilities).
+        /// Only available for float types.
+        pub fn logValidate(v: []const T) bool {
+            comptime if (!is_float) @compileError("logValidate requires a float type");
+            for (v) |x| {
+                if (math.isNan(x) or math.isInf(x) or x > 0) return false;
+            }
+            return true;
+        }
     };
 }
 
@@ -401,4 +486,184 @@ test "VecI32 large array sum matches scalar" {
     var scalar_sum: i32 = 0;
     for (buf) |x| scalar_sum += x;
     try testing.expectEqual(scalar_sum, VecI32.sum(&buf));
+}
+
+// ---- New f64 tests: logNorm, log, exp, relativeEntropy, sort, validate ----
+
+test "VecF64.logNorm" {
+    // Start with log-probabilities that don't sum to 1 in probability space.
+    // After logNorm, sum(exp(v[i])) should equal 1.
+    var v = [_]f64{ -1.0, -2.0, -3.0 };
+    VecF64.logNorm(&v);
+    // Verify sum of exp(v[i]) == 1.
+    var prob_sum: f64 = 0;
+    for (v) |x| prob_sum += @exp(x);
+    try testing.expectApproxEqAbs(1.0, prob_sum, 1e-12);
+}
+
+test "VecF64.logNorm preserves relative order" {
+    var v = [_]f64{ 0.0, 1.0, 2.0, 3.0 };
+    VecF64.logNorm(&v);
+    // Values should still be increasing.
+    try testing.expect(v[0] < v[1]);
+    try testing.expect(v[1] < v[2]);
+    try testing.expect(v[2] < v[3]);
+}
+
+test "VecF64.logNorm empty" {
+    var v = [_]f64{};
+    VecF64.logNorm(&v); // should not panic
+}
+
+test "VecF64.log" {
+    const src = [_]f64{ 1.0, @exp(1.0), @exp(2.0) };
+    var dest: [3]f64 = undefined;
+    VecF64.log(&dest, &src);
+    try testing.expectApproxEqAbs(0.0, dest[0], 1e-12);
+    try testing.expectApproxEqAbs(1.0, dest[1], 1e-12);
+    try testing.expectApproxEqAbs(2.0, dest[2], 1e-12);
+}
+
+test "VecF64.log handles zero" {
+    const src = [_]f64{ 0.0, 1.0 };
+    var dest: [2]f64 = undefined;
+    VecF64.log(&dest, &src);
+    try testing.expect(dest[0] == -std.math.inf(f64));
+    try testing.expectApproxEqAbs(0.0, dest[1], 1e-12);
+}
+
+test "VecF64.exp" {
+    const src = [_]f64{ 0.0, 1.0, 2.0 };
+    var dest: [3]f64 = undefined;
+    VecF64.exp(&dest, &src);
+    try testing.expectApproxEqAbs(1.0, dest[0], 1e-12);
+    try testing.expectApproxEqAbs(@exp(1.0), dest[1], 1e-12);
+    try testing.expectApproxEqAbs(@exp(2.0), dest[2], 1e-12);
+}
+
+test "VecF64.log and exp roundtrip" {
+    const original = [_]f64{ 0.25, 0.5, 1.0, 2.0, 10.0 };
+    var logged: [5]f64 = undefined;
+    var restored: [5]f64 = undefined;
+    VecF64.log(&logged, &original);
+    VecF64.exp(&restored, &logged);
+    for (original, restored) |o, r| {
+        try testing.expectApproxEqAbs(o, r, 1e-12);
+    }
+}
+
+test "VecF64.relativeEntropy identical distributions" {
+    const p = [_]f64{ 0.25, 0.25, 0.25, 0.25 };
+    const q = [_]f64{ 0.25, 0.25, 0.25, 0.25 };
+    try testing.expectApproxEqAbs(0.0, VecF64.relativeEntropy(&p, &q), 1e-12);
+}
+
+test "VecF64.relativeEntropy known value" {
+    // D_KL([0.5, 0.5, 0, 0] || [0.25, 0.25, 0.25, 0.25])
+    // = 0.5*ln(0.5/0.25) + 0.5*ln(0.5/0.25) = ln(2)
+    const p = [_]f64{ 0.5, 0.5, 0, 0 };
+    const q = [_]f64{ 0.25, 0.25, 0.25, 0.25 };
+    try testing.expectApproxEqAbs(@log(2.0), VecF64.relativeEntropy(&p, &q), 1e-12);
+}
+
+test "VecF64.relativeEntropy q_i zero with p_i positive returns inf" {
+    const p = [_]f64{ 0.5, 0.5 };
+    const q = [_]f64{ 1.0, 0.0 };
+    try testing.expect(VecF64.relativeEntropy(&p, &q) == std.math.inf(f64));
+}
+
+test "VecF64.sortIncreasing" {
+    var v = [_]f64{ 3, 1, 4, 1, 5, 9, 2, 6 };
+    VecF64.sortIncreasing(&v);
+    try testing.expectApproxEqAbs(1.0, v[0], 1e-12);
+    try testing.expectApproxEqAbs(1.0, v[1], 1e-12);
+    try testing.expectApproxEqAbs(2.0, v[2], 1e-12);
+    try testing.expectApproxEqAbs(3.0, v[3], 1e-12);
+    try testing.expectApproxEqAbs(4.0, v[4], 1e-12);
+    try testing.expectApproxEqAbs(5.0, v[5], 1e-12);
+    try testing.expectApproxEqAbs(6.0, v[6], 1e-12);
+    try testing.expectApproxEqAbs(9.0, v[7], 1e-12);
+}
+
+test "VecF64.sortDecreasing" {
+    var v = [_]f64{ 3, 1, 4, 1, 5, 9, 2, 6 };
+    VecF64.sortDecreasing(&v);
+    try testing.expectApproxEqAbs(9.0, v[0], 1e-12);
+    try testing.expectApproxEqAbs(6.0, v[1], 1e-12);
+    try testing.expectApproxEqAbs(5.0, v[2], 1e-12);
+    try testing.expectApproxEqAbs(4.0, v[3], 1e-12);
+    try testing.expectApproxEqAbs(3.0, v[4], 1e-12);
+    try testing.expectApproxEqAbs(2.0, v[5], 1e-12);
+    try testing.expectApproxEqAbs(1.0, v[6], 1e-12);
+    try testing.expectApproxEqAbs(1.0, v[7], 1e-12);
+}
+
+test "VecI32.sortIncreasing" {
+    var v = [_]i32{ 5, 3, 8, 1, 4 };
+    VecI32.sortIncreasing(&v);
+    try testing.expectEqual(@as(i32, 1), v[0]);
+    try testing.expectEqual(@as(i32, 3), v[1]);
+    try testing.expectEqual(@as(i32, 4), v[2]);
+    try testing.expectEqual(@as(i32, 5), v[3]);
+    try testing.expectEqual(@as(i32, 8), v[4]);
+}
+
+test "VecI32.sortDecreasing" {
+    var v = [_]i32{ 5, 3, 8, 1, 4 };
+    VecI32.sortDecreasing(&v);
+    try testing.expectEqual(@as(i32, 8), v[0]);
+    try testing.expectEqual(@as(i32, 5), v[1]);
+    try testing.expectEqual(@as(i32, 4), v[2]);
+    try testing.expectEqual(@as(i32, 3), v[3]);
+    try testing.expectEqual(@as(i32, 1), v[4]);
+}
+
+test "VecF64.validate all finite" {
+    const v = [_]f64{ 1.0, -2.0, 0.0, 3.14 };
+    try testing.expect(VecF64.validate(&v));
+}
+
+test "VecF64.validate with NaN" {
+    const v = [_]f64{ 1.0, std.math.nan(f64), 3.0 };
+    try testing.expect(!VecF64.validate(&v));
+}
+
+test "VecF64.validate with Inf" {
+    const v = [_]f64{ 1.0, std.math.inf(f64), 3.0 };
+    try testing.expect(!VecF64.validate(&v));
+}
+
+test "VecF64.validate with negative Inf" {
+    const v = [_]f64{ 1.0, -std.math.inf(f64), 3.0 };
+    try testing.expect(!VecF64.validate(&v));
+}
+
+test "VecF64.validate empty" {
+    const v = [_]f64{};
+    try testing.expect(VecF64.validate(&v));
+}
+
+test "VecF64.logValidate valid log-probabilities" {
+    const v = [_]f64{ -1.0, -2.0, -0.5, 0.0 };
+    try testing.expect(VecF64.logValidate(&v));
+}
+
+test "VecF64.logValidate rejects positive values" {
+    const v = [_]f64{ -1.0, 0.5, -2.0 };
+    try testing.expect(!VecF64.logValidate(&v));
+}
+
+test "VecF64.logValidate rejects NaN" {
+    const v = [_]f64{ -1.0, std.math.nan(f64) };
+    try testing.expect(!VecF64.logValidate(&v));
+}
+
+test "VecF64.logValidate rejects negative Inf" {
+    const v = [_]f64{ -1.0, -std.math.inf(f64) };
+    try testing.expect(!VecF64.logValidate(&v));
+}
+
+test "VecF64.logValidate empty" {
+    const v = [_]f64{};
+    try testing.expect(VecF64.logValidate(&v));
 }
