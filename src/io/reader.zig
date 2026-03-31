@@ -1002,6 +1002,55 @@ test "Reader.openWithIndex: works without ssi file" {
     try std.testing.expectEqualStrings("alpha", seq.name);
 }
 
+test "Reader.openWithIndex: loads easel ssi file when present" {
+    const allocator = std.testing.allocator;
+    const easel_ssi = @import("../ssi/easel.zig");
+    const fasta_data = ">alpha\nACGT\n>beta\nGGGG\n";
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.fasta", .data = fasta_data });
+
+    // Build an Easel-format SSI index.
+    // Keys must be alphabetically sorted for binary search.
+    var ssi_buf = std.ArrayList(u8){};
+    defer ssi_buf.deinit(allocator);
+
+    try easel_ssi.writeEaselHeader(&ssi_buf, allocator, .{
+        .nprimary = 2,
+        .nsecondary = 0,
+        .file_names = &.{"test.fasta"},
+    });
+    // alpha: '>' at byte 0, data after ">alpha\n" = byte 7, len = 4
+    try easel_ssi.writePrimaryKey(&ssi_buf, allocator, .{
+        .key = "alpha", .r_off = 0, .d_off = 7, .len = 4,
+    });
+    // beta: '>' at byte 12, data after ">beta\n" = byte 18, len = 4
+    try easel_ssi.writePrimaryKey(&ssi_buf, allocator, .{
+        .key = "beta", .r_off = 12, .d_off = 18, .len = 4,
+    });
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.fasta.ssi", .data = ssi_buf.items });
+
+    const dir_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/test.fasta", .{dir_path});
+    defer allocator.free(full_path);
+
+    var reader = try Reader.openWithIndex(allocator, &alphabet_mod.dna, full_path, .fasta);
+    defer reader.deinit();
+
+    // SSI index should be loaded as easel variant.
+    try std.testing.expect(reader.ssi_index != null);
+    try std.testing.expect(reader.ssi_index.? == .easel);
+
+    // Fetch by name should work.
+    var seq = (try reader.fetch("beta")) orelse return error.ExpectedSequence;
+    defer seq.deinit();
+    try std.testing.expectEqualStrings("beta", seq.name);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 2, 2, 2 }, seq.dsq);
+}
+
 // --- Stdin and gzip tests ---
 
 test "Reader.isGzip: detects gzip magic bytes" {
