@@ -16,6 +16,11 @@ pub const dsqdata = @import("dsqdata.zig");
 pub const tree = @import("tree.zig");
 pub const matrix = @import("matrix.zig");
 pub const wuss = @import("wuss.zig");
+pub const cluster = @import("cluster.zig");
+pub const varint = @import("varint.zig");
+pub const graph = @import("graph.zig");
+pub const cpu = @import("cpu.zig");
+pub const ratematrix = @import("ratematrix.zig");
 
 // Include tests from all sub-modules in `zig build test`.
 test {
@@ -37,4 +42,9 @@ test {
     _ = tree;
     _ = matrix;
     _ = wuss;
+    _ = cluster;
+    _ = varint;
+    _ = graph;
+    _ = cpu;
+    _ = ratematrix;
 }
