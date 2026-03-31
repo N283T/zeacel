@@ -7,14 +7,19 @@ const Msa = @import("msa.zig").Msa;
 /// Compute position-based (PB/Henikoff & Henikoff 1994) weights for an MSA.
 ///
 /// For each alignment column:
-///   - Count r: the number of distinct residue types (gaps excluded).
+///   - Count r: the number of distinct canonical residue types
+///     (gaps and degenerate codes are excluded).
 ///   - For each residue type, count n: how many sequences carry that residue.
 ///   - Each sequence at that column contributes 1 / (r * n) to its weight.
-/// Weights are normalized so that they sum to nseq.
+///
+/// After accumulation, each weight is divided by the sequence's residue
+/// count (per-sequence-length normalization, matching Easel's
+/// esl_msaweight_PB_adv). Then weights are normalized to sum to nseq.
 ///
 /// Returns an allocated slice of length nseq. Caller owns the memory.
 pub fn positionBased(allocator: Allocator, m: Msa) ![]f64 {
     const n = m.nseq();
+    const k = m.abc.k; // number of canonical residue codes
     const weights = try allocator.alloc(f64, n);
     @memset(weights, 0.0);
 
@@ -22,31 +27,43 @@ pub fn positionBased(allocator: Allocator, m: Msa) ![]f64 {
     const MAX_KP = 30;
 
     for (0..m.alen) |col| {
-        // Count occurrences of each digital code in this column (skip gaps).
+        // Count occurrences of each digital code in this column.
+        // Only canonical residues (code < K) are counted; degenerate
+        // codes (>= K), gaps, missing, and nonresidues are ignored.
         var type_counts: [MAX_KP]u32 = .{0} ** MAX_KP;
         for (0..n) |seq| {
             const code = m.seqs[seq][col];
-            if (!m.abc.isGap(code)) {
+            if (code < k) {
                 type_counts[code] += 1;
             }
         }
 
-        // Count how many distinct residue types are present.
+        // Count how many distinct canonical types are present.
         var r: u32 = 0;
-        for (type_counts[0..m.abc.kp]) |c| {
+        for (type_counts[0..k]) |c| {
             if (c > 0) r += 1;
         }
-        if (r == 0) continue; // all-gap column
+        if (r == 0) continue; // all-gap/degenerate column
 
-        // Accumulate weight contribution for each non-gap sequence.
+        // Accumulate weight contribution for each canonical-residue sequence.
         for (0..n) |seq| {
             const code = m.seqs[seq][col];
-            if (!m.abc.isGap(code)) {
+            if (code < k) {
                 const n_i: f64 = @floatFromInt(type_counts[code]);
                 const r_f: f64 = @floatFromInt(r);
                 weights[seq] += 1.0 / (r_f * n_i);
             }
         }
+    }
+
+    // Per-sequence-length normalization: divide each weight by the number
+    // of canonical residues in that sequence (matching Easel's behavior).
+    for (0..n) |seq| {
+        var rlen: u32 = 0;
+        for (0..m.alen) |col| {
+            if (m.seqs[seq][col] < k) rlen += 1;
+        }
+        if (rlen > 0) weights[seq] /= @floatFromInt(rlen);
     }
 
     // Normalize so that weights sum to nseq.
@@ -116,19 +133,23 @@ pub fn blosum(allocator: Allocator, m: Msa, id_threshold: f64) ![]f64 {
 /// Compute percent identity between two aligned sequences.
 /// Positions where either sequence has a gap are excluded from the comparison.
 /// Returns 0.0 if there are no comparable (ungapped) positions.
+/// Pairwise identity using Easel's definition: MIN(len1, len2) denominator.
 pub fn pairwiseIdentity(m: Msa, i: usize, j: usize) f64 {
     var matches: u32 = 0;
-    var compared: u32 = 0;
+    var len1: u32 = 0;
+    var len2: u32 = 0;
     for (0..m.alen) |col| {
         const a = m.seqs[i][col];
         const b = m.seqs[j][col];
-        if (!m.abc.isGap(a) and !m.abc.isGap(b)) {
-            compared += 1;
-            if (a == b) matches += 1;
-        }
+        const a_res = !m.abc.isGap(a);
+        const b_res = !m.abc.isGap(b);
+        if (a_res) len1 += 1;
+        if (b_res) len2 += 1;
+        if (a_res and b_res and a == b) matches += 1;
     }
-    if (compared == 0) return 0.0;
-    return @as(f64, @floatFromInt(matches)) / @as(f64, @floatFromInt(compared));
+    const denom = @min(len1, len2);
+    if (denom == 0) return 0.0;
+    return @as(f64, @floatFromInt(matches)) / @as(f64, @floatFromInt(denom));
 }
 
 // --- Union-Find helpers ---

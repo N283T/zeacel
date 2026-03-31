@@ -65,12 +65,14 @@ pub const ScoreMatrix = struct {
         return m;
     }
 
-    /// Compute the expected score E = sum_ij f_i * S_ij * f_j given background frequencies.
-    pub fn expectedScore(self: ScoreMatrix, bg: *const [20]f64) f64 {
+    /// Compute the expected score E = sum_ij fi[i] * S_ij * fj[j].
+    /// fi and fj are the query and target background frequencies respectively.
+    /// For symmetric scoring, pass the same array for both.
+    pub fn expectedScore(self: ScoreMatrix, fi: *const [20]f64, fj: *const [20]f64) f64 {
         var e: f64 = 0;
         for (0..20) |i| {
             for (0..20) |j| {
-                e += bg[i] * @as(f64, @floatFromInt(self.data[i][j])) * bg[j];
+                e += fi[i] * @as(f64, @floatFromInt(self.data[i][j])) * fj[j];
             }
         }
         return e;
@@ -434,7 +436,7 @@ test "maxScore and minScore" {
 }
 
 test "expectedScore: BLOSUM62 with BL62 background is negative" {
-    const e = blosum62.expectedScore(&composition.bl62);
+    const e = blosum62.expectedScore(&composition.bl62, &composition.bl62);
     try std.testing.expect(e < 0);
 }
 
