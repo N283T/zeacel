@@ -9,7 +9,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const ssi = @import("../ssi.zig");
-const SsiEntry = ssi.SsiEntry;
 
 pub const EASEL_MAGIC: u32 = 0xd3d3c9b3;
 pub const EASEL_MAGIC_SWAPPED: u32 = 0xb3c9d3d3;
@@ -89,7 +88,7 @@ pub const EaselIndex = struct {
         pos += 4;
         const slen = readIntFromBuf(u32, hdr_buf[pos..], endian);
         pos += 4;
-        // frecsize (skip)
+        const frecsize = readIntFromBuf(u32, hdr_buf[pos..], endian);
         pos += 4;
         const precsize = readIntFromBuf(u32, hdr_buf[pos..], endian);
         pos += 4;
@@ -103,8 +102,7 @@ pub const EaselIndex = struct {
         const soffset = readOffsetFromBuf(hdr_buf[pos..], offsz, endian);
 
         // Read file info section from disk.
-        const frecsize: usize = @as(usize, flen) + 16;
-        const file_section_size = frecsize * @as(usize, nfiles);
+        const file_section_size = @as(usize, frecsize) * @as(usize, nfiles);
         const file_section_buf = try allocator.alloc(u8, file_section_size);
         defer allocator.free(file_section_buf);
 
@@ -121,6 +119,7 @@ pub const EaselIndex = struct {
 
         var fpos: usize = 0;
         for (0..nfiles) |i| {
+            const rec_start = fpos;
             const name_bytes = file_section_buf[fpos..][0..flen];
             fpos += flen;
 
@@ -141,6 +140,10 @@ pub const EaselIndex = struct {
             fpos += 4;
             const rpl = readIntFromBuf(u32, file_section_buf[fpos..], endian);
             fpos += 4;
+
+            // Advance to next record using frecsize, which may be larger than
+            // flen + 16 if a future Easel version adds extra fields.
+            fpos = rec_start + @as(usize, frecsize);
 
             files[i] = FileInfo{
                 .name = name,
@@ -278,7 +281,7 @@ pub fn writeEaselHeader(
     }
 }
 
-fn writeOffset(writer: anytype, value: u64, offsz: u8, endian: std.builtin.Endian) !void {
+pub fn writeOffset(writer: anytype, value: u64, offsz: u8, endian: std.builtin.Endian) !void {
     switch (offsz) {
         4 => try writer.writeInt(u32, @intCast(value), endian),
         8 => try writer.writeInt(u64, value, endian),
@@ -382,4 +385,54 @@ test "EaselIndex.read: parses byteswapped header" {
     try std.testing.expectEqualStrings("swapped.fa", idx.files[0].name);
     try std.testing.expectEqual(@as(u32, 100), idx.files[0].bpl);
     try std.testing.expectEqual(@as(u32, 80), idx.files[0].rpl);
+}
+
+test "EaselIndex.read: parses header with 4-byte offsets" {
+    const allocator = std.testing.allocator;
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+
+    try writeEaselHeader(&buf, allocator, .{
+        .nfiles = 2,
+        .nprimary = 10,
+        .nsecondary = 3,
+        .flen = 16,
+        .plen = 16,
+        .slen = 16,
+        .offsz = 4,
+        .file_names = &.{ "small1.fa", "small2.fa" },
+        .file_formats = &.{ 1, 2 },
+        .file_flags = &.{ 0, 0 },
+        .file_bpls = &.{ 60, 70 },
+        .file_rpls = &.{ 50, 55 },
+    });
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "off4.ssi", .data = buf.items });
+    const file = try tmp_dir.dir.openFile("off4.ssi", .{});
+
+    var idx = try EaselIndex.read(allocator, file);
+    defer idx.deinit();
+
+    try std.testing.expectEqual(false, idx.byteswap);
+    try std.testing.expectEqual(@as(u8, 4), idx.offsz);
+    try std.testing.expectEqual(@as(u16, 2), idx.nfiles);
+    try std.testing.expectEqual(@as(u64, 10), idx.nprimary);
+    try std.testing.expectEqual(@as(u64, 3), idx.nsecondary);
+    try std.testing.expectEqual(@as(u32, 16), idx.plen);
+    try std.testing.expectEqual(@as(u32, 16), idx.slen);
+
+    // File info.
+    try std.testing.expectEqual(@as(usize, 2), idx.files.len);
+    try std.testing.expectEqualStrings("small1.fa", idx.files[0].name);
+    try std.testing.expectEqual(@as(u32, 1), idx.files[0].format);
+    try std.testing.expectEqual(@as(u32, 60), idx.files[0].bpl);
+    try std.testing.expectEqual(@as(u32, 50), idx.files[0].rpl);
+    try std.testing.expectEqualStrings("small2.fa", idx.files[1].name);
+    try std.testing.expectEqual(@as(u32, 2), idx.files[1].format);
+    try std.testing.expectEqual(@as(u32, 70), idx.files[1].bpl);
+    try std.testing.expectEqual(@as(u32, 55), idx.files[1].rpl);
 }
