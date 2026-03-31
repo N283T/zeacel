@@ -5,6 +5,7 @@ pub const stockholm = @import("io/stockholm.zig");
 pub const genbank = @import("io/genbank.zig");
 pub const clustal = @import("io/clustal.zig");
 pub const afa = @import("io/afa.zig");
+pub const phylip = @import("io/phylip.zig");
 pub const Reader = @import("io/reader.zig").Reader;
 pub const Writer = @import("io/writer.zig").Writer;
 pub const Format = @import("io/reader.zig").Format;
@@ -25,4 +26,5 @@ test {
     _ = genbank_mod;
     _ = clustal_mod;
     _ = afa_mod;
+    _ = @import("io/phylip.zig");
 }
