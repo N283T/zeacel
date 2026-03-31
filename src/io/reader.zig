@@ -5,7 +5,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Alphabet = @import("../alphabet.zig").Alphabet;
 const Sequence = @import("../sequence.zig").Sequence;
-const SsiIndex = @import("../ssi.zig").SsiIndex;
+const ssi_mod = @import("../ssi.zig");
+const SsiIndex = ssi_mod.SsiIndex;
+const ZeaselIndex = ssi_mod.ZeaselIndex;
 const fasta = @import("fasta.zig");
 const stockholm = @import("stockholm.zig");
 const genbank = @import("genbank.zig");
@@ -210,26 +212,19 @@ pub const Reader = struct {
     /// Open a file and create a reader, also loading a `.ssi` index if present.
     /// The index file is looked up at `<path>.ssi`. If the index file does not
     /// exist, the reader is created without an index (fetch/fetchSubseq will
-    /// return error.NoIndex).
+    /// return error.NoIndex). Auto-detects both zeasel and Easel SSI formats.
     pub fn openWithIndex(allocator: Allocator, abc: *const Alphabet, path: []const u8, format: ?Format) !Reader {
         var reader = try fromFile(allocator, abc, path, format);
         errdefer reader.deinit();
 
-        // Try to load "<path>.ssi"
+        // Try to load "<path>.ssi" with auto-detection.
         const ssi_path = try std.fmt.allocPrint(allocator, "{s}.ssi", .{path});
         defer allocator.free(ssi_path);
 
-        const ssi_file = std.fs.cwd().openFile(ssi_path, .{}) catch |err| switch (err) {
+        var ssi_index = SsiIndex.open(allocator, ssi_path) catch |err| switch (err) {
             error.FileNotFound => return reader,
             else => return err,
         };
-        defer ssi_file.close();
-
-        const ssi_data = try ssi_file.readToEndAlloc(allocator, std.math.maxInt(usize));
-        defer allocator.free(ssi_data);
-
-        var stream = std.io.fixedBufferStream(ssi_data);
-        var ssi_index = try SsiIndex.read(allocator, stream.reader().any());
         errdefer ssi_index.deinit();
 
         reader.ssi_index = ssi_index;
@@ -242,8 +237,9 @@ pub const Reader = struct {
     /// Returns null if the key is not found in the index.
     /// Returns error.NoIndex if no SSI index is loaded.
     pub fn fetch(self: *Reader, key: []const u8) !?Sequence {
-        const index = self.ssi_index orelse return error.NoIndex;
-        const entry = index.lookup(key) orelse return null;
+        var index = self.ssi_index orelse return error.NoIndex;
+        const entry = (try index.lookup(self.allocator, key)) orelse return null;
+        defer self.allocator.free(entry.name);
         const offset = entry.offset;
         if (offset >= self.data.len) return error.InvalidOffset;
 
@@ -838,7 +834,7 @@ test "Reader.fetch: retrieves sequence by name via SSI index" {
     defer reader.deinit();
 
     // Build an SSI index from the same data and attach it.
-    reader.ssi_index = try SsiIndex.buildFromFasta(allocator, data);
+    reader.ssi_index = SsiIndex{ .zeasel = try ZeaselIndex.buildFromFasta(allocator, data) };
 
     // Fetch seq2 directly (skipping seq1).
     var seq2 = (try reader.fetch("seq2")) orelse return error.ExpectedSequence;
@@ -859,7 +855,7 @@ test "Reader.fetch: returns null for unknown key" {
 
     var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .fasta);
     defer reader.deinit();
-    reader.ssi_index = try SsiIndex.buildFromFasta(allocator, data);
+    reader.ssi_index = SsiIndex{ .zeasel = try ZeaselIndex.buildFromFasta(allocator, data) };
 
     const result = try reader.fetch("nonexistent");
     try std.testing.expectEqual(@as(?Sequence, null), result);
@@ -871,7 +867,7 @@ test "Reader.fetchSubseq: extracts subsequence by coordinates" {
 
     var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .fasta);
     defer reader.deinit();
-    reader.ssi_index = try SsiIndex.buildFromFasta(allocator, data);
+    reader.ssi_index = SsiIndex{ .zeasel = try ZeaselIndex.buildFromFasta(allocator, data) };
 
     // Fetch positions 3-6 (1-indexed inclusive): GTAC
     var sub = (try reader.fetchSubseq("seq1", 3, 6)) orelse return error.ExpectedSequence;
@@ -895,7 +891,7 @@ test "Reader.fetchSubseq: reverse complement when start > end" {
 
     var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .fasta);
     defer reader.deinit();
-    reader.ssi_index = try SsiIndex.buildFromFasta(allocator, data);
+    reader.ssi_index = SsiIndex{ .zeasel = try ZeaselIndex.buildFromFasta(allocator, data) };
 
     // start=3, end=2 means reverse complement of positions 2..3
     // Forward region [2..3] (1-indexed) of ACGT = C(1),G(2)
@@ -911,7 +907,7 @@ test "Reader.fetchSubseq: returns null for unknown key" {
 
     var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .fasta);
     defer reader.deinit();
-    reader.ssi_index = try SsiIndex.buildFromFasta(allocator, data);
+    reader.ssi_index = SsiIndex{ .zeasel = try ZeaselIndex.buildFromFasta(allocator, data) };
 
     const result = try reader.fetchSubseq("nonexistent", 1, 2);
     try std.testing.expectEqual(@as(?Sequence, null), result);
@@ -923,7 +919,7 @@ test "Reader.fetchSubseq: returns error for out-of-range coordinates" {
 
     var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .fasta);
     defer reader.deinit();
-    reader.ssi_index = try SsiIndex.buildFromFasta(allocator, data);
+    reader.ssi_index = SsiIndex{ .zeasel = try ZeaselIndex.buildFromFasta(allocator, data) };
 
     try std.testing.expectError(error.InvalidCoordinate, reader.fetchSubseq("seq1", 1, 10));
     try std.testing.expectError(error.InvalidCoordinate, reader.fetchSubseq("seq1", 0, 2));
@@ -950,7 +946,7 @@ test "Reader.openWithIndex: loads ssi file when present" {
     try tmp_dir.dir.writeFile(.{ .sub_path = "test.fasta", .data = fasta_data });
 
     // Build an index from the FASTA data and write it to a buffer.
-    var idx = try SsiIndex.buildFromFasta(allocator, fasta_data);
+    var idx = try ZeaselIndex.buildFromFasta(allocator, fasta_data);
     defer idx.deinit();
 
     var ssi_buf = std.ArrayList(u8){};

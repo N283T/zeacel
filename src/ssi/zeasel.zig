@@ -251,7 +251,8 @@ pub const ZeaselIndex = struct {
 
 // --- Tests ---
 
-const SsiIndex = ssi.SsiIndex;
+// Use ZeaselIndex directly for tests (SsiIndex is now a tagged union).
+const SsiIndex = ZeaselIndex;
 
 test "buildFromFasta: correct offsets" {
     const allocator = std.testing.allocator;
