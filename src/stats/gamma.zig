@@ -167,6 +167,31 @@ pub fn fitComplete(x: []const f64, mu: f64) !FitResult {
     };
 }
 
+/// Log PDF: tau*log(lambda) - lgamma(a) + (a-1)*log(t) - t, where t = lambda*(x-mu).
+/// Returns -inf for x <= mu.
+pub fn logPdf(x: f64, mu: f64, lambda: f64, a: f64) f64 {
+    if (x <= mu) return -math.inf(f64);
+    const t = lambda * (x - mu);
+    return @log(lambda) - math.lgamma(f64, a) + (a - 1.0) * @log(t) - t;
+}
+
+/// Log CDF: log(P(a, lambda*(x-mu))).
+/// Returns -inf for x <= mu.
+pub fn logCdf(x: f64, mu: f64, lambda: f64, a: f64) f64 {
+    if (x <= mu) return -math.inf(f64);
+    const val = incompleteGamma(a, lambda * (x - mu));
+    return @log(val);
+}
+
+/// Log survival: log(1 - P(a, lambda*(x-mu))).
+/// Returns 0 for x <= mu.
+pub fn logSurv(x: f64, mu: f64, lambda: f64, a: f64) f64 {
+    if (x <= mu) return 0.0;
+    const p = incompleteGamma(a, lambda * (x - mu));
+    // When p is near 0, log(1-p) ~ -p via log1p.
+    return math.log1p(-p);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -260,4 +285,40 @@ test "fitComplete: gamma exponential special case (alpha~1)" {
     try std.testing.expect(result.alpha > 0.3);
     try std.testing.expect(result.alpha < 3.0);
     try std.testing.expect(result.lambda > 0.1);
+}
+
+test "gamma logPdf matches log(pdf)" {
+    const xs = [_]f64{ 0.5, 1.0, 2.0, 5.0 };
+    for (xs) |x| {
+        const lp = logPdf(x, 0.0, 1.0, 2.0);
+        const expected = @log(pdf(x, 0.0, 1.0, 2.0));
+        try std.testing.expect(math.approxEqAbs(f64, lp, expected, 1e-12));
+    }
+}
+
+test "gamma logPdf at or below mu is -inf" {
+    try std.testing.expect(math.isInf(logPdf(0.0, 0.0, 1.0, 2.0)));
+    try std.testing.expect(logPdf(0.0, 0.0, 1.0, 2.0) < 0.0);
+}
+
+test "gamma logCdf matches log(cdf)" {
+    const xs = [_]f64{ 0.5, 1.0, 2.0, 5.0 };
+    for (xs) |x| {
+        const lc = logCdf(x, 0.0, 1.0, 2.0);
+        const expected = @log(cdf(x, 0.0, 1.0, 2.0));
+        try std.testing.expect(math.approxEqAbs(f64, lc, expected, 1e-10));
+    }
+}
+
+test "gamma logSurv matches log(surv)" {
+    const xs = [_]f64{ 0.5, 1.0, 2.0, 5.0 };
+    for (xs) |x| {
+        const ls = logSurv(x, 0.0, 1.0, 2.0);
+        const expected = @log(surv(x, 0.0, 1.0, 2.0));
+        try std.testing.expect(math.approxEqAbs(f64, ls, expected, 1e-10));
+    }
+}
+
+test "gamma logSurv at or below mu is zero" {
+    try std.testing.expectEqual(@as(f64, 0.0), logSurv(0.0, 0.0, 1.0, 2.0));
 }

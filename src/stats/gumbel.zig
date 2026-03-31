@@ -48,6 +48,13 @@ pub fn logSurv(x: f64, mu: f64, lambda: f64) f64 {
     return math.log1p(-@exp(-@exp(-z)));
 }
 
+/// Log CDF: -exp(-z), the direct elegant form.
+/// Since cdf = exp(-exp(-z)), log(cdf) = -exp(-z).
+pub fn logCdf(x: f64, mu: f64, lambda: f64) f64 {
+    const z = lambda * (x - mu);
+    return -@exp(-z);
+}
+
 /// Inverse CDF (quantile): mu - (1/lambda) * log(-log(p))
 pub fn invcdf(p: f64, mu: f64, lambda: f64) f64 {
     return mu - (1.0 / lambda) * @log(-@log(p));
@@ -476,4 +483,21 @@ test "gumbel fitCensoredLoc recovers mu" {
 test "gumbel fitCensoredLoc error on small input" {
     const x = [_]f64{1.0};
     try std.testing.expectError(error.InsufficientData, fitCensoredLoc(&x, 10, 0.0, 0.5));
+}
+
+test "gumbel logCdf matches log(cdf)" {
+    const xs = [_]f64{ -2.0, 0.0, 1.0, 3.0, 5.0 };
+    for (xs) |x| {
+        const lc = logCdf(x, 0.0, 1.0);
+        const expected = @log(cdf(x, 0.0, 1.0));
+        try std.testing.expect(math.approxEqAbs(f64, lc, expected, 1e-12));
+    }
+}
+
+test "gumbel logCdf direct form" {
+    // logCdf = -exp(-z), verify the elegant identity
+    const z: f64 = 2.0;
+    const x = z; // mu=0, lambda=1
+    const lc = logCdf(x, 0.0, 1.0);
+    try std.testing.expect(math.approxEqAbs(f64, lc, -@exp(-z), 1e-14));
 }
