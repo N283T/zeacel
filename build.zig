@@ -4,14 +4,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const mod = b.addModule("zeacel", .{
+    const mod = b.addModule("zeasel", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     const lib = b.addLibrary(.{
-        .name = "zeacel",
+        .name = "zeasel",
         .linkage = .static,
         .root_module = mod,
     });
@@ -31,9 +31,9 @@ pub fn build(b: *std.Build) void {
     const tools_step = b.step("tools", "Build CLI tools");
 
     const tool_defs = [_]struct { name: []const u8, src: []const u8 }{
-        .{ .name = "zeacel-seqstat", .src = "src/tools/seqstat.zig" },
-        .{ .name = "zeacel-reformat", .src = "src/tools/reformat.zig" },
-        .{ .name = "zeacel-seqfetch", .src = "src/tools/seqfetch.zig" },
+        .{ .name = "zeasel-seqstat", .src = "src/tools/seqstat.zig" },
+        .{ .name = "zeasel-reformat", .src = "src/tools/reformat.zig" },
+        .{ .name = "zeasel-seqfetch", .src = "src/tools/seqfetch.zig" },
     };
 
     inline for (tool_defs) |tool| {
@@ -44,7 +44,7 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .imports = &.{
-                    .{ .name = "zeacel", .module = mod },
+                    .{ .name = "zeasel", .module = mod },
                 },
             }),
         });
