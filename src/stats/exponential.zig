@@ -23,6 +23,32 @@ pub fn surv(x: f64, mu: f64, lambda: f64) f64 {
     return @exp(-lambda * (x - mu));
 }
 
+/// Log PDF: log(lambda) - lambda*(x - mu) for x >= mu, else -inf.
+pub fn logPdf(x: f64, mu: f64, lambda: f64) f64 {
+    if (x < mu) return -math.inf(f64);
+    return @log(lambda) - lambda * (x - mu);
+}
+
+/// Log CDF: log(1 - exp(-lambda*(x - mu))) for x >= mu, else -inf.
+/// Uses log1p and direct approximations for numerical stability.
+pub fn logCdf(x: f64, mu: f64, lambda: f64) f64 {
+    if (x < mu) return -math.inf(f64);
+    const y = lambda * (x - mu);
+    if (y == 0.0) return -math.inf(f64);
+    const ey = @exp(-y);
+    // When y is small, 1-e^{-y} ~ y, so log(cdf) ~ log(y).
+    if (y < 1e-7) return @log(y);
+    // When y is large, e^{-y} is tiny, so log(1-e^{-y}) ~ -e^{-y}.
+    if (ey < 1e-7) return -ey;
+    return math.log1p(-ey);
+}
+
+/// Log survival: -lambda * (x - mu) for x >= mu, else 0.
+pub fn logSurv(x: f64, mu: f64, lambda: f64) f64 {
+    if (x < mu) return 0.0;
+    return -lambda * (x - mu);
+}
+
 /// Inverse CDF: mu - (1/lambda) * log(1 - p)
 pub fn invcdf(p: f64, mu: f64, lambda: f64) f64 {
     return mu - (1.0 / lambda) * @log(1.0 - p);
@@ -157,4 +183,40 @@ test "fitCompleteScale: known mu" {
     for (data) |xi| sum += xi;
     const expected = @as(f64, @floatFromInt(data.len)) / sum;
     try std.testing.expectApproxEqAbs(expected, lambda, 1e-10);
+}
+
+test "exponential logPdf matches log(pdf)" {
+    const xs = [_]f64{ 0.5, 1.0, 2.0, 5.0 };
+    for (xs) |x| {
+        const lp = logPdf(x, 0.0, 1.0);
+        const expected = @log(pdf(x, 0.0, 1.0));
+        try std.testing.expect(math.approxEqAbs(f64, lp, expected, 1e-12));
+    }
+}
+
+test "exponential logPdf below mu is -inf" {
+    try std.testing.expect(math.isInf(logPdf(-1.0, 0.0, 1.0)));
+    try std.testing.expect(logPdf(-1.0, 0.0, 1.0) < 0.0);
+}
+
+test "exponential logCdf matches log(cdf)" {
+    const xs = [_]f64{ 0.5, 1.0, 2.0, 5.0 };
+    for (xs) |x| {
+        const lc = logCdf(x, 0.0, 1.0);
+        const expected = @log(cdf(x, 0.0, 1.0));
+        try std.testing.expect(math.approxEqAbs(f64, lc, expected, 1e-10));
+    }
+}
+
+test "exponential logSurv matches log(surv)" {
+    const xs = [_]f64{ 0.5, 1.0, 2.0, 5.0 };
+    for (xs) |x| {
+        const ls = logSurv(x, 0.0, 1.0);
+        const expected = @log(surv(x, 0.0, 1.0));
+        try std.testing.expect(math.approxEqAbs(f64, ls, expected, 1e-12));
+    }
+}
+
+test "exponential logSurv below mu is zero" {
+    try std.testing.expectEqual(@as(f64, 0.0), logSurv(-1.0, 0.0, 1.0));
 }

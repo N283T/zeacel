@@ -38,6 +38,40 @@ pub fn surv(x: f64, mu: f64, lambda: f64, tau: f64) f64 {
     return @exp(-math.pow(f64, u, tau));
 }
 
+/// Log PDF: log(tau) + tau*log(lambda) + (tau-1)*log(x-mu) - (lambda*(x-mu))^tau
+/// Returns -inf for x < mu, handles x == mu boundary cases.
+pub fn logPdf(x: f64, mu: f64, lambda: f64, tau: f64) f64 {
+    if (x < mu) return -math.inf(f64);
+    if (x == mu) {
+        if (tau < 1.0) return math.inf(f64);
+        if (tau > 1.0) return -math.inf(f64);
+        return @log(lambda); // tau == 1: exponential
+    }
+    const y = lambda * (x - mu);
+    return @log(tau) + tau * @log(lambda) + (tau - 1.0) * @log(x - mu) - math.pow(f64, y, tau);
+}
+
+/// Log CDF: log(1 - exp(-(lambda*(x-mu))^tau)).
+/// Uses log1p and approximations for numerical stability.
+pub fn logCdf(x: f64, mu: f64, lambda: f64, tau: f64) f64 {
+    if (x <= mu) return -math.inf(f64);
+    const y = lambda * (x - mu);
+    const ytau = math.pow(f64, y, tau); // = (lambda*(x-mu))^tau
+    // When ytau is very small, 1 - exp(-ytau) ~ ytau, so log(cdf) ~ log(ytau).
+    if (ytau < 1e-7) return @log(ytau);
+    const eterm = @exp(-ytau); // = exp(-y^tau)
+    // When exp(-y^tau) is tiny, log(1 - exp(-y^tau)) ~ -exp(-y^tau).
+    if (eterm < 1e-7) return -eterm;
+    return math.log1p(-eterm);
+}
+
+/// Log survival: -(lambda*(x-mu))^tau for x >= mu, else 0.
+pub fn logSurv(x: f64, mu: f64, lambda: f64, tau: f64) f64 {
+    if (x <= mu) return 0.0;
+    const y = lambda * (x - mu);
+    return -math.pow(f64, y, tau);
+}
+
 /// Inverse CDF: mu + (1/lambda) * (-log(1-p))^(1/tau)
 pub fn invcdf(p: f64, mu: f64, lambda: f64, tau: f64) f64 {
     return mu + (1.0 / lambda) * math.pow(f64, -@log(1.0 - p), 1.0 / tau);
@@ -45,7 +79,7 @@ pub fn invcdf(p: f64, mu: f64, lambda: f64, tau: f64) f64 {
 
 /// Log-PDF for fitting: log(tau*lambda) + (tau-1)*log(lambda*(x-mu)) - (lambda*(x-mu))^tau
 /// Returns -inf for x at mu when tau < 1 (skip these in fitting, following Easel).
-fn logPdf(x: f64, mu: f64, lambda: f64, tau: f64) f64 {
+fn logPdfFitting(x: f64, mu: f64, lambda: f64, tau: f64) f64 {
     if (x < mu) return -math.inf(f64);
     const u = lambda * (x - mu);
     if (u == 0.0) {
@@ -71,7 +105,7 @@ fn weibullObjective(p: []const f64, user_data: ?*anyopaque) f64 {
     var nll: f64 = 0;
     for (data.x) |xi| {
         if (tau < 1.0 and xi == data.mu) continue; // skip infinity, following Easel
-        nll -= logPdf(xi, data.mu, lambda, tau);
+        nll -= logPdfFitting(xi, data.mu, lambda, tau);
     }
     return nll;
 }
@@ -290,4 +324,40 @@ test "fitComplete: weibull exponential special case (tau~1)" {
     // lambda should be close to 0.5
     try std.testing.expect(result.lambda > 0.1);
     try std.testing.expect(result.lambda < 2.0);
+}
+
+test "weibull logPdf matches log(pdf)" {
+    const xs = [_]f64{ 0.5, 1.0, 2.0, 5.0 };
+    for (xs) |x| {
+        const lp = logPdf(x, 0.0, 1.0, 2.0);
+        const expected = @log(pdf(x, 0.0, 1.0, 2.0));
+        try std.testing.expect(math.approxEqAbs(f64, lp, expected, 1e-12));
+    }
+}
+
+test "weibull logPdf below mu is -inf" {
+    try std.testing.expect(math.isInf(logPdf(-1.0, 0.0, 1.0, 2.0)));
+    try std.testing.expect(logPdf(-1.0, 0.0, 1.0, 2.0) < 0.0);
+}
+
+test "weibull logCdf matches log(cdf)" {
+    const xs = [_]f64{ 0.5, 1.0, 2.0, 5.0 };
+    for (xs) |x| {
+        const lc = logCdf(x, 0.0, 1.0, 2.0);
+        const expected = @log(cdf(x, 0.0, 1.0, 2.0));
+        try std.testing.expect(math.approxEqAbs(f64, lc, expected, 1e-10));
+    }
+}
+
+test "weibull logSurv matches log(surv)" {
+    const xs = [_]f64{ 0.5, 1.0, 2.0, 5.0 };
+    for (xs) |x| {
+        const ls = logSurv(x, 0.0, 1.0, 2.0);
+        const expected = @log(surv(x, 0.0, 1.0, 2.0));
+        try std.testing.expect(math.approxEqAbs(f64, ls, expected, 1e-12));
+    }
+}
+
+test "weibull logSurv below mu is zero" {
+    try std.testing.expectEqual(@as(f64, 0.0), logSurv(-1.0, 0.0, 1.0, 2.0));
 }
