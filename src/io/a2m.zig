@@ -160,14 +160,44 @@ fn isInsertChar(ch: u8) bool {
     return (ch >= 'a' and ch <= 'z') or ch == '.';
 }
 
-/// Write an MSA in A2M format (uppercase for all columns, no insert distinction).
+/// Write an MSA in A2M format.
+///
+/// When the MSA has an RF (reference) annotation, it drives the
+/// consensus/insert distinction:
+/// - Consensus columns (RF char is not '.', '-', '_', '~'): uppercase residues, '-' for gaps.
+/// - Insert columns (RF char is '.', '-', '_', '~'): lowercase residues, gaps omitted.
+///
+/// Without RF annotation, all columns are treated as consensus (plain uppercase FASTA-like).
 pub fn write(msa: Msa, dest: std.io.AnyWriter) !void {
     for (0..msa.nseq()) |i| {
         try dest.writeByte('>');
         try dest.writeAll(msa.names[i]);
         try dest.writeByte('\n');
-        for (msa.seqs[i]) |code| {
-            try dest.writeByte(msa.abc.decode(code));
+        for (0..msa.alen) |col| {
+            const code = msa.seqs[i][col];
+            const ch = msa.abc.decode(code);
+            const is_gap = msa.abc.isGap(code);
+
+            if (msa.reference) |rf| {
+                const rf_ch = rf[col];
+                const is_insert = (rf_ch == '.' or rf_ch == '-' or rf_ch == '_' or rf_ch == '~');
+                if (is_insert) {
+                    // Insert column: lowercase residues, omit gaps
+                    if (!is_gap) {
+                        try dest.writeByte(std.ascii.toLower(ch));
+                    }
+                } else {
+                    // Consensus column: uppercase residues, '-' for gaps
+                    if (is_gap) {
+                        try dest.writeByte('-');
+                    } else {
+                        try dest.writeByte(std.ascii.toUpper(ch));
+                    }
+                }
+            } else {
+                // No RF annotation: all consensus (uppercase), same as FASTA
+                try dest.writeByte(ch);
+            }
         }
         try dest.writeByte('\n');
     }
@@ -236,7 +266,7 @@ test "parse: periods become gaps in insert columns" {
     try std.testing.expectEqual(@as(usize, 3), msa.alen); // 2 consensus + 1 insert
 }
 
-test "write: round trip" {
+test "write: round trip without RF" {
     const allocator = std.testing.allocator;
     const abc = &@import("../alphabet.zig").dna;
 
@@ -253,4 +283,49 @@ test "write: round trip" {
     defer msa2.deinit();
 
     try std.testing.expect(msa.compare(msa2));
+}
+
+test "write: RF annotation produces case-distinguished A2M" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("../alphabet.zig").dna;
+
+    // 5-column alignment: columns 0,2,4 are consensus (RF='x'),
+    // columns 1,3 are insert (RF='.').
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "AACGT", "A-C-T" };
+    var msa = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer msa.deinit();
+
+    msa.reference = try allocator.dupe(u8, "x.x.x");
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try write(msa, buf.writer(allocator).any());
+
+    // s1: col0='A'(cons,A), col1='A'(ins,a), col2='C'(cons,C), col3='G'(ins,g), col4='T'(cons,T)
+    // => "AaCgT"
+    // s2: col0='A'(cons,A), col1='-'(ins,omit), col2='C'(cons,C), col3='-'(ins,omit), col4='T'(cons,T)
+    // => "ACT"
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "AaCgT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "ACT\n") != null);
+}
+
+test "write: RF annotation with gap in consensus column" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("../alphabet.zig").dna;
+
+    // 3-column alignment, all consensus. Seq2 has a gap.
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "ACG", "A-G" };
+    var msa = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer msa.deinit();
+
+    msa.reference = try allocator.dupe(u8, "xxx");
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try write(msa, buf.writer(allocator).any());
+
+    // Consensus gap should be '-'
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "A-G") != null);
 }
