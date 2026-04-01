@@ -156,13 +156,97 @@ pub fn write(dest: std.io.AnyWriter, m: Msa) !void {
             try dest.writeByte('\n');
         }
 
-        // Write a blank conservation line (all spaces) to match real Clustal output.
+        // Write conservation line.
         for (0..max_name_len + col_sep) |_| try dest.writeByte(' ');
+        for (col..end) |c| {
+            try dest.writeByte(conservationChar(m, c));
+        }
         try dest.writeByte('\n');
 
         col = end;
     }
 }
+
+/// Compute the conservation character for a single column.
+/// Returns '*' if all residues identical, ':' for strong conservation,
+/// '.' for weak conservation, ' ' otherwise.
+/// For DNA/RNA alphabets, only full identity ('*') is marked.
+fn conservationChar(m: Msa, col: usize) u8 {
+    // Collect the set of non-gap residue codes in this column.
+    var seen: u32 = 0; // bitmask of canonical codes seen
+    var count: usize = 0;
+    for (0..m.nseq()) |i| {
+        const code = m.seqs[i][col];
+        if (m.abc.isGap(code)) continue;
+        if (m.abc.isCanonical(code)) {
+            seen |= @as(u32, 1) << @intCast(code);
+            count += 1;
+        } else {
+            // Degenerate/unknown: cannot determine conservation
+            return ' ';
+        }
+    }
+
+    if (count == 0) return ' ';
+
+    // Check full identity: only one bit set
+    if (seen & (seen - 1) == 0) return '*';
+
+    // For DNA/RNA, only mark identity
+    if (m.abc.kind != .amino) return ' ';
+
+    // Amino acid conservation groups (Easel convention)
+    // Strong groups: if all residues fall within one group -> ':'
+    if (matchesAnyGroup(m.abc, seen, &strong_groups)) return ':';
+
+    // Weak groups: if all residues fall within one group -> '.'
+    if (matchesAnyGroup(m.abc, seen, &weak_groups)) return '.';
+
+    return ' ';
+}
+
+/// Check if all residues in `seen` bitmask fall within at least one conservation group.
+fn matchesAnyGroup(abc: *const Alphabet, seen: u32, groups: []const []const u8) bool {
+    for (groups) |group| {
+        var group_mask: u32 = 0;
+        for (group) |ch| {
+            const code = abc.encode(ch) catch continue;
+            if (abc.isCanonical(code)) {
+                group_mask |= @as(u32, 1) << @intCast(code);
+            }
+        }
+        if (seen & ~group_mask == 0) return true;
+    }
+    return false;
+}
+
+// Easel strong conservation groups (amino acids)
+const strong_groups = [_][]const u8{
+    "STA",
+    "NEQK",
+    "NHQK",
+    "NDEQ",
+    "QHRK",
+    "MILV",
+    "MILF",
+    "HY",
+    "FYW",
+};
+
+// Easel weak conservation groups (amino acids)
+const weak_groups = [_][]const u8{
+    "CSA",
+    "ATV",
+    "SAG",
+    "STNK",
+    "STPA",
+    "SGND",
+    "SNDEQK",
+    "NDEQHK",
+    "NEQHRK",
+    "FVLIM",
+    "HFY",
+};
 
 /// Check if haystack contains needle, case-insensitive.
 fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
@@ -316,6 +400,48 @@ test "write: basic output" {
     try std.testing.expect(std.mem.startsWith(u8, buf.items, "CLUSTAL"));
     // Must contain the sequence name.
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "seq1") != null);
+    // Identical sequences should produce all-star conservation line.
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "****************") != null);
+}
+
+test "write: conservation line with amino acid groups" {
+    const allocator = std.testing.allocator;
+    // STA is a strong group, CSA is a weak group
+    // Column 0: S,S => identical => '*'
+    // Column 1: T,A => both in STA (strong) => ':'
+    // Column 2: C,A => both in CSA (weak) => '.'
+    // Column 3: S,W => not in any group => ' '
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "STCS", "SAAW" };
+
+    var msa = try Msa.fromText(allocator, &alphabet_mod.amino, &names, &seqs);
+    defer msa.deinit();
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+
+    try write(buf.writer(allocator).any(), msa);
+
+    // Find conservation line: it starts after the name padding
+    // The conservation should be "*:. "
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "*:. ") != null);
+}
+
+test "write: DNA conservation only marks identity" {
+    const allocator = std.testing.allocator;
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "ACGT", "ACGA" };
+
+    var msa = try Msa.fromText(allocator, &alphabet_mod.dna, &names, &seqs);
+    defer msa.deinit();
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+
+    try write(buf.writer(allocator).any(), msa);
+
+    // Columns 0-2 identical => '***', column 3 differs => ' '
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "*** ") != null);
 }
 
 test "round trip" {
