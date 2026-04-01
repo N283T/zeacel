@@ -1,9 +1,11 @@
 // Phylogenetic tree construction and serialisation.
-// Currently implements UPGMA clustering from a flat pairwise distance matrix
-// and Newick format output.
+// Implements UPGMA / linkage clustering from a flat pairwise distance matrix,
+// Newick format I/O (including quoted labels and comments), and conversion
+// back to a distance matrix via pairwise path-length summation.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Matrix = @import("matrix.zig").Matrix;
 
 /// A rooted binary tree stored in arrays indexed by node ID.
 /// Node IDs 0..(n_leaves-1) are leaves; n_leaves..(n_nodes-1) are internal.
@@ -227,6 +229,145 @@ pub const Tree = struct {
 
         return true;
     }
+
+    /// Compute a symmetric pairwise distance matrix from the tree.
+    /// Entry (i,j) is the sum of branch lengths along the unique path
+    /// between leaf i and leaf j.  The matrix is n_leaves x n_leaves.
+    pub fn toDistanceMatrix(self: Tree, allocator: Allocator) !Matrix {
+        const n = self.n_leaves;
+        var mat = try Matrix.init(allocator, n, n);
+        errdefer mat.deinit();
+
+        // Precompute depth (distance-from-root) for every node via BFS.
+        const depth = try allocator.alloc(f64, self.n_nodes);
+        defer allocator.free(depth);
+        @memset(depth, 0.0);
+
+        var queue: std.ArrayList(usize) = .empty;
+        defer queue.deinit(allocator);
+
+        // Find root.
+        var root: usize = 0;
+        for (0..self.n_nodes) |idx| {
+            if (self.parent[idx] == -1) {
+                root = idx;
+                break;
+            }
+        }
+        depth[root] = 0.0;
+        try queue.append(allocator, root);
+        var head: usize = 0;
+        while (head < queue.items.len) {
+            const node = queue.items[head];
+            head += 1;
+            if (self.left[node] >= 0) {
+                const lc: usize = @intCast(self.left[node]);
+                depth[lc] = depth[node] + self.branch_length[lc];
+                try queue.append(allocator, lc);
+            }
+            if (self.right[node] >= 0) {
+                const rc: usize = @intCast(self.right[node]);
+                depth[rc] = depth[node] + self.branch_length[rc];
+                try queue.append(allocator, rc);
+            }
+        }
+
+        // For each pair of leaves, find LCA and compute distance =
+        // depth[a] + depth[b] - 2*depth[lca].
+        const ancestor_mark = try allocator.alloc(bool, self.n_nodes);
+        defer allocator.free(ancestor_mark);
+
+        for (0..n) |a| {
+            @memset(ancestor_mark, false);
+            var cur: i32 = @intCast(a);
+            while (cur >= 0) {
+                ancestor_mark[@intCast(cur)] = true;
+                cur = self.parent[@intCast(cur)];
+            }
+            for (a + 1..n) |b| {
+                var walk: i32 = @intCast(b);
+                while (walk >= 0 and !ancestor_mark[@intCast(walk)]) {
+                    walk = self.parent[@intCast(walk)];
+                }
+                const lca_idx: usize = @intCast(walk);
+                const dist = depth[a] + depth[b] - 2.0 * depth[lca_idx];
+                mat.set(a, b, dist);
+                mat.set(b, a, dist);
+            }
+        }
+
+        return mat;
+    }
+
+    /// Verify that clade sizes (leaf counts per subtree) are consistent.
+    /// Returns true if every internal node's clade size equals the sum of
+    /// its children's clade sizes, and every leaf has clade size 1.
+    pub fn verifyCladesizes(self: Tree) bool {
+        var clade_size: [512]usize = undefined;
+        if (self.n_nodes > 512) return false;
+        for (0..self.n_nodes) |idx| clade_size[idx] = 0;
+
+        for (0..self.n_leaves) |idx| clade_size[idx] = 1;
+
+        // Post-order traversal.
+        var visited: [512]bool = undefined;
+        for (0..self.n_nodes) |idx| visited[idx] = false;
+
+        var stk: [512]usize = undefined;
+        var sp: usize = 0;
+
+        var rt: usize = 0;
+        for (0..self.n_nodes) |idx| {
+            if (self.parent[idx] == -1) {
+                rt = idx;
+                break;
+            }
+        }
+
+        stk[sp] = rt;
+        sp += 1;
+        while (sp > 0) {
+            const node = stk[sp - 1];
+            const lc = self.left[node];
+            const rc = self.right[node];
+            const lc_done = (lc < 0 or visited[@intCast(lc)]);
+            const rc_done = (rc < 0 or visited[@intCast(rc)]);
+            if (lc_done and rc_done) {
+                if (node >= self.n_leaves) {
+                    const left_size = if (lc >= 0) clade_size[@intCast(lc)] else 0;
+                    const right_size = if (rc >= 0) clade_size[@intCast(rc)] else 0;
+                    clade_size[node] = left_size + right_size;
+                }
+                visited[node] = true;
+                sp -= 1;
+            } else {
+                if (!rc_done) {
+                    stk[sp] = @intCast(rc);
+                    sp += 1;
+                }
+                if (!lc_done) {
+                    stk[sp] = @intCast(lc);
+                    sp += 1;
+                }
+            }
+        }
+
+        if (clade_size[rt] != self.n_leaves) return false;
+
+        for (0..self.n_leaves) |idx| {
+            if (clade_size[idx] != 1) return false;
+        }
+
+        for (self.n_leaves..self.n_nodes) |idx| {
+            const lc = self.left[idx];
+            const rc = self.right[idx];
+            const expected = (if (lc >= 0) clade_size[@intCast(lc)] else 0) +
+                (if (rc >= 0) clade_size[@intCast(rc)] else 0);
+            if (clade_size[idx] != expected) return false;
+        }
+
+        return true;
+    }
 };
 
 /// Build a UPGMA tree from a distance matrix.
@@ -383,30 +524,88 @@ fn writeNewickNode(tree: Tree, dest: std.io.AnyWriter, node: i32) !void {
     }
 }
 
+/// Skip a Newick comment `[...]` starting at position `pos`.
+/// Returns the index of the character after the closing `]`, or `pos`
+/// unchanged when the character at `pos` is not `[`.
+fn skipNewickComment(data: []const u8, pos: usize) usize {
+    var p = pos;
+    if (p < data.len and data[p] == '[') {
+        p += 1;
+        while (p < data.len and data[p] != ']') : (p += 1) {}
+        if (p < data.len) p += 1; // skip ']'
+    }
+    return p;
+}
+
+/// Skip whitespace and Newick comments.
+fn skipNewickWs(data: []const u8, pos: usize) usize {
+    var p = pos;
+    while (p < data.len) {
+        switch (data[p]) {
+            ' ', '\t', '\n', '\r' => p += 1,
+            '[' => p = skipNewickComment(data, p),
+            else => break,
+        }
+    }
+    return p;
+}
+
+/// Return true when `c` is a Newick structural delimiter or whitespace.
+fn isNewickDelimiter(c: u8) bool {
+    return switch (c) {
+        ':', ',', ')', ';', '(', '[', ' ', '\t', '\n', '\r' => true,
+        else => false,
+    };
+}
+
 /// Parse a Newick format string into a Tree.
-/// Supports labeled leaves, branch lengths, and nested clades.
-/// Example: "((A:0.1,B:0.2):0.3,C:0.4);"
+/// Supports labeled leaves, branch lengths, nested clades,
+/// single-quoted labels (with `''` as escaped quote), and
+/// Newick comments in square brackets `[...]`.
+///
+/// Examples:
+///   `((A:0.1,B:0.2):0.3,C:0.4);`
+///   `('species A':1.0,'species B':2.0);`
+///   `(A:1.0[comment],B:2.0);`
 pub fn readNewick(allocator: Allocator, input: []const u8) !Tree {
-    // First pass: count leaves and internal nodes
+    // --- First pass: count leaves and internal nodes ---
     var n_leaves: usize = 0;
     var n_internal: usize = 0;
     var i: usize = 0;
-    while (i < input.len) : (i += 1) {
+    while (i < input.len) {
+        i = skipNewickWs(input, i);
+        if (i >= input.len) break;
         switch (input[i]) {
-            '(' => n_internal += 1,
-            ',' => {},
-            ')' => {},
-            ';', '\n', '\r', ' ', '\t' => {},
-            ':' => {
-                // Skip branch length
+            '(' => {
+                n_internal += 1;
                 i += 1;
-                while (i < input.len and input[i] != ',' and input[i] != ')' and input[i] != ';' and input[i] != '(' and input[i] != ' ') : (i += 1) {}
-                if (i < input.len) i -= 1; // will be incremented by loop
+            },
+            ',', ')' => i += 1,
+            ';' => i += 1,
+            ':' => {
+                i += 1;
+                i = skipNewickWs(input, i);
+                while (i < input.len and !isNewickDelimiter(input[i])) : (i += 1) {}
+            },
+            '\'' => {
+                n_leaves += 1;
+                i += 1;
+                while (i < input.len) {
+                    if (input[i] == '\'') {
+                        if (i + 1 < input.len and input[i + 1] == '\'') {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
             },
             else => {
-                // Start of a leaf name
                 n_leaves += 1;
-                while (i + 1 < input.len and input[i + 1] != ':' and input[i + 1] != ',' and input[i + 1] != ')' and input[i + 1] != ';' and input[i + 1] != '(' and input[i + 1] != ' ') : (i += 1) {}
+                while (i < input.len and !isNewickDelimiter(input[i]) and input[i] != '\'') : (i += 1) {}
             },
         }
     }
@@ -437,7 +636,7 @@ pub fn readNewick(allocator: Allocator, input: []const u8) !Tree {
     }
     @memset(names_arr, null);
 
-    // Stack for parsing
+    // Stack for parsing.
     var stack: std.ArrayList(usize) = .empty;
     defer stack.deinit(allocator);
 
@@ -446,17 +645,18 @@ pub fn readNewick(allocator: Allocator, input: []const u8) !Tree {
     var current_node: ?usize = null;
 
     i = 0;
-    while (i < input.len) : (i += 1) {
+    while (i < input.len) {
+        i = skipNewickWs(input, i);
+        if (i >= input.len) break;
         switch (input[i]) {
             '(' => {
-                // Push current context, start new internal node
                 const new_node = next_internal;
                 next_internal += 1;
                 try stack.append(allocator, new_node);
                 current_node = null;
+                i += 1;
             },
             ',' => {
-                // Attach current_node as a child of the top-of-stack internal node
                 if (current_node) |cn| {
                     if (stack.items.len > 0) {
                         const parent_node = stack.items[stack.items.len - 1];
@@ -467,19 +667,17 @@ pub fn readNewick(allocator: Allocator, input: []const u8) !Tree {
                             right_arr[parent_node] = @intCast(cn);
                             parent[cn] = @intCast(parent_node);
                         } else {
-                            // Multifurcation: more than 2 children
                             return error.MultifurcationNotSupported;
                         }
                     }
                 }
                 current_node = null;
+                i += 1;
             },
             ')' => {
-                // Close the internal node
                 if (stack.items.len == 0) return error.InvalidInput;
                 const internal_node = stack.pop().?;
 
-                // Attach current_node as child
                 if (current_node) |cn| {
                     if (left_arr[internal_node] < 0) {
                         left_arr[internal_node] = @intCast(cn);
@@ -492,26 +690,48 @@ pub fn readNewick(allocator: Allocator, input: []const u8) !Tree {
                 }
 
                 current_node = internal_node;
+                i += 1;
             },
             ':' => {
-                // Parse branch length for current_node
                 i += 1;
+                i = skipNewickWs(input, i);
                 const start = i;
-                while (i < input.len and input[i] != ',' and input[i] != ')' and input[i] != ';' and input[i] != '(' and input[i] != ' ' and input[i] != '\n') : (i += 1) {}
+                while (i < input.len and !isNewickDelimiter(input[i])) : (i += 1) {}
                 if (current_node) |cn| {
                     bl[cn] = std.fmt.parseFloat(f64, input[start..i]) catch return error.InvalidFormat;
                 }
-                if (i < input.len) i -= 1;
             },
-            ';', '\n', '\r', ' ', '\t' => {},
-            else => {
-                // Leaf name
-                const start = i;
-                while (i + 1 < input.len and input[i + 1] != ':' and input[i + 1] != ',' and input[i + 1] != ')' and input[i + 1] != ';' and input[i + 1] != '(') : (i += 1) {}
+            ';' => break,
+            '\'' => {
+                // Single-quoted label. '' is an escaped single quote.
+                i += 1;
+                var label: std.ArrayList(u8) = .empty;
+                defer label.deinit(allocator);
+                while (i < input.len) {
+                    if (input[i] == '\'') {
+                        if (i + 1 < input.len and input[i + 1] == '\'') {
+                            try label.append(allocator, '\'');
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        try label.append(allocator, input[i]);
+                        i += 1;
+                    }
+                }
                 const leaf_node = next_leaf;
                 next_leaf += 1;
-                names_arr[leaf_node] = try allocator.dupe(u8, input[start .. i + 1]);
-
+                names_arr[leaf_node] = try allocator.dupe(u8, label.items);
+                current_node = leaf_node;
+            },
+            else => {
+                const start = i;
+                while (i < input.len and !isNewickDelimiter(input[i]) and input[i] != '\'') : (i += 1) {}
+                const leaf_node = next_leaf;
+                next_leaf += 1;
+                names_arr[leaf_node] = try allocator.dupe(u8, input[start..i]);
                 current_node = leaf_node;
             },
         }
@@ -1062,4 +1282,127 @@ test "simulate: error on fewer than 2 leaves" {
     var rng = Random.init(1);
     try std.testing.expectError(error.InvalidInput, simulate(std.testing.allocator, 1, &rng));
     try std.testing.expectError(error.InvalidInput, simulate(std.testing.allocator, 0, &rng));
+}
+
+test "toDistanceMatrix: simple 3-taxon tree" {
+    const allocator = std.testing.allocator;
+    // Tree: ((A:1.0,B:2.0):0.5,C:3.0);
+    // Distance A-B = 1.0 + 2.0 = 3.0
+    // Distance A-C = 1.0 + 0.5 + 3.0 = 4.5
+    // Distance B-C = 2.0 + 0.5 + 3.0 = 5.5
+    var tree = try readNewick(allocator, "((A:1.0,B:2.0):0.5,C:3.0);");
+    defer tree.deinit();
+
+    var mat = try tree.toDistanceMatrix(allocator);
+    defer mat.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), mat.rows);
+    try std.testing.expectEqual(@as(usize, 3), mat.cols);
+
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), mat.get(0, 0), 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), mat.get(1, 1), 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), mat.get(2, 2), 1e-10);
+
+    // A-B = 1.0 + 2.0 = 3.0
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), mat.get(0, 1), 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), mat.get(1, 0), 1e-10);
+
+    // A-C = 1.0 + 0.5 + 3.0 = 4.5
+    try std.testing.expectApproxEqAbs(@as(f64, 4.5), mat.get(0, 2), 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.5), mat.get(2, 0), 1e-10);
+
+    // B-C = 2.0 + 0.5 + 3.0 = 5.5
+    try std.testing.expectApproxEqAbs(@as(f64, 5.5), mat.get(1, 2), 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.5), mat.get(2, 1), 1e-10);
+}
+
+test "toDistanceMatrix: 2-taxon tree" {
+    const allocator = std.testing.allocator;
+    var tree = try readNewick(allocator, "(X:0.3,Y:0.7);");
+    defer tree.deinit();
+
+    var mat = try tree.toDistanceMatrix(allocator);
+    defer mat.deinit();
+
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), mat.get(0, 1), 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), mat.get(1, 0), 1e-10);
+}
+
+test "toDistanceMatrix: round-trip from UPGMA" {
+    const allocator = std.testing.allocator;
+    const dist = [_]f64{
+        0.0, 0.4, 0.8,
+        0.4, 0.0, 0.8,
+        0.8, 0.8, 0.0,
+    };
+    const names_arr = [_][]const u8{ "A", "B", "C" };
+    var tree = try upgma(allocator, &dist, 3, &names_arr);
+    defer tree.deinit();
+
+    var mat = try tree.toDistanceMatrix(allocator);
+    defer mat.deinit();
+
+    // UPGMA should recover the original distances for this ultrametric matrix.
+    for (0..3) |a| {
+        for (0..3) |b| {
+            try std.testing.expectApproxEqAbs(dist[a * 3 + b], mat.get(a, b), 1e-10);
+        }
+    }
+}
+
+test "readNewick: quoted labels" {
+    const allocator = std.testing.allocator;
+    var tree = try readNewick(allocator, "('species A':1.0,'species B':2.0);");
+    defer tree.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), tree.n_leaves);
+    try std.testing.expectEqualStrings("species A", tree.names[0].?);
+    try std.testing.expectEqualStrings("species B", tree.names[1].?);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), tree.branch_length[0], 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), tree.branch_length[1], 1e-10);
+}
+
+test "readNewick: quoted label with escaped quote" {
+    const allocator = std.testing.allocator;
+    var tree = try readNewick(allocator, "('it''s A':1.0,B:2.0);");
+    defer tree.deinit();
+
+    try std.testing.expectEqualStrings("it's A", tree.names[0].?);
+    try std.testing.expectEqualStrings("B", tree.names[1].?);
+}
+
+test "readNewick: Newick comments" {
+    const allocator = std.testing.allocator;
+    var tree = try readNewick(allocator, "(A:1.0[comment],B:2.0);");
+    defer tree.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), tree.n_leaves);
+    try std.testing.expectEqualStrings("A", tree.names[0].?);
+    try std.testing.expectEqualStrings("B", tree.names[1].?);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), tree.branch_length[0], 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), tree.branch_length[1], 1e-10);
+}
+
+test "readNewick: comments in various positions" {
+    const allocator = std.testing.allocator;
+    var tree = try readNewick(allocator, "[pre]([c1]A:0.1[c2],[c3]B:0.2[c4])[c5];");
+    defer tree.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), tree.n_leaves);
+    try std.testing.expectEqualStrings("A", tree.names[0].?);
+    try std.testing.expectEqualStrings("B", tree.names[1].?);
+}
+
+test "verifyCladesizes: valid tree" {
+    const allocator = std.testing.allocator;
+    var tree = try readNewick(allocator, "((A:0.1,B:0.2):0.3,C:0.4);");
+    defer tree.deinit();
+    try std.testing.expect(tree.verifyCladesizes());
+}
+
+test "verifyCladesizes: valid 4-taxon tree" {
+    const allocator = std.testing.allocator;
+    var tree = try readNewick(allocator, "(((A:0.1,B:0.2):0.3,C:0.4):0.1,D:0.5);");
+    defer tree.deinit();
+    try std.testing.expect(tree.verifyCladesizes());
 }
