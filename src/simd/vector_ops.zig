@@ -1,5 +1,6 @@
 const std = @import("std");
 const math = std.math;
+const simd_math = @import("math.zig");
 
 /// Returns a namespace with vector operations for the given element type T.
 /// Reduction operations (sum, dot, max, min) use @Vector for SIMD acceleration.
@@ -262,21 +263,51 @@ pub fn VectorOps(comptime T: type) type {
         /// Element-wise natural log: dest[i] = ln(src[i]).
         /// For src[i] <= 0, dest[i] = -inf.
         /// Only available for float types. Slices must have equal length.
+        ///
+        /// For f32, uses the vectorized Cephes/Easel polynomial approximation
+        /// (`simd_math.logf_vec`) which operates on native SIMD vectors.
         pub fn log(dest: []T, src: []const T) void {
             comptime if (!is_float) @compileError("log requires a float type");
             std.debug.assert(dest.len == src.len);
-            for (dest, src) |*d, s| {
-                d.* = if (s > 0) @log(s) else -math.inf(T);
+            if (T == f32) {
+                var i: usize = 0;
+                while (i + vec_len <= src.len) : (i += vec_len) {
+                    const chunk: V = src[i..][0..vec_len].*;
+                    dest[i..][0..vec_len].* = simd_math.logf_vec(vec_len, chunk);
+                }
+                // Scalar tail
+                while (i < src.len) : (i += 1) {
+                    dest[i] = if (src[i] > 0) @log(src[i]) else -math.inf(T);
+                }
+            } else {
+                for (dest, src) |*d, s| {
+                    d.* = if (s > 0) @log(s) else -math.inf(T);
+                }
             }
         }
 
         /// Element-wise exp: dest[i] = exp(src[i]).
         /// Only available for float types. Slices must have equal length.
+        ///
+        /// For f32, uses the vectorized Cephes/Easel polynomial approximation
+        /// (`simd_math.expf_vec`) which operates on native SIMD vectors.
         pub fn exp(dest: []T, src: []const T) void {
             comptime if (!is_float) @compileError("exp requires a float type");
             std.debug.assert(dest.len == src.len);
-            for (dest, src) |*d, s| {
-                d.* = @exp(s);
+            if (T == f32) {
+                var i: usize = 0;
+                while (i + vec_len <= src.len) : (i += vec_len) {
+                    const chunk: V = src[i..][0..vec_len].*;
+                    dest[i..][0..vec_len].* = simd_math.expf_vec(vec_len, chunk);
+                }
+                // Scalar tail
+                while (i < src.len) : (i += 1) {
+                    dest[i] = @exp(src[i]);
+                }
+            } else {
+                for (dest, src) |*d, s| {
+                    d.* = @exp(s);
+                }
             }
         }
 
