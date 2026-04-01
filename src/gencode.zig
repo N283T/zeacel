@@ -223,6 +223,29 @@ pub const GeneticCode = struct {
             }
         }
     }
+
+    /// Return a mutable copy of this genetic code.
+    /// Since GeneticCode is a value type with only arrays and a slice,
+    /// a simple copy suffices.
+    pub fn clone(self: GeneticCode) GeneticCode {
+        return self;
+    }
+
+    /// Mark all sense (non-stop) codons as initiators.
+    /// Equivalent to Easel's esl_gencode_SetInitiatorAny.
+    pub fn setInitiatorAny(self: *GeneticCode) void {
+        for (0..64) |idx| {
+            self.is_start[idx] = self.codon_table[idx] != STOP_CODON;
+        }
+    }
+
+    /// Clear all initiators and set only ATG as the start codon.
+    /// Equivalent to Easel's esl_gencode_SetInitiatorOnlyAUG.
+    pub fn setInitiatorOnlyAUG(self: *GeneticCode) void {
+        self.is_start = .{false} ** 64;
+        // ATG: A=0, T=3, G=2 -> index = 0*16 + 3*4 + 2 = 14
+        self.is_start[codonIndex(0, 3, 2)] = true;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -1075,4 +1098,37 @@ test "findOrfs: start codon translates to Met" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "clone returns independent mutable copy" {
+    var code = standard.clone();
+    // Mutating the clone should not affect the original (it's a value copy).
+    code.is_start[0] = !standard.is_start[0];
+    try std.testing.expect(code.is_start[0] != standard.is_start[0]);
+}
+
+test "setInitiatorAny: all sense codons are starts" {
+    var code = standard.clone();
+    code.setInitiatorAny();
+    // CTG (which is normally a start) should still be start
+    try std.testing.expect(code.isStart(1, 3, 2));
+    // AAA (Lys, not normally a start) should now be start
+    try std.testing.expect(code.isStart(0, 0, 0));
+    // TAA (stop) should NOT be start
+    try std.testing.expect(!code.isStart(3, 0, 0));
+    // TAG (stop) should NOT be start
+    try std.testing.expect(!code.isStart(3, 0, 2));
+    // TGA (stop) should NOT be start
+    try std.testing.expect(!code.isStart(3, 2, 0));
+}
+
+test "setInitiatorOnlyAUG: only ATG is start" {
+    var code = standard.clone();
+    code.setInitiatorOnlyAUG();
+    // ATG should be start
+    try std.testing.expect(code.isStart(0, 3, 2));
+    // CTG (normally a start) should NOT be start
+    try std.testing.expect(!code.isStart(1, 3, 2));
+    // TTG (normally a start) should NOT be start
+    try std.testing.expect(!code.isStart(3, 3, 2));
 }
