@@ -173,6 +173,115 @@ pub fn shuffleDi(rng: *Random, dsq: []u8, k: u8) void {
     dsq[dsq.len - 1] = iE[x];
 }
 
+/// Generate a random sequence preserving 0th-order (mono-residue) composition.
+///
+/// Counts residue frequencies in `dsq` (only codes 0..K-1), normalizes to
+/// probabilities, then generates a new sequence by sampling from that distribution.
+/// The caller owns the returned slice and must free it with `allocator`.
+pub fn markov0(allocator: Allocator, rng: *Random, dsq: []const u8, K: usize) ![]u8 {
+    if (dsq.len == 0) return try allocator.alloc(u8, 0);
+
+    // Count residue frequencies.
+    var counts: [MAX_K]u64 = .{0} ** MAX_K;
+    var total: u64 = 0;
+    for (dsq) |code| {
+        if (code < K) {
+            counts[code] += 1;
+            total += 1;
+        }
+    }
+
+    // Normalize to probabilities.
+    var freq: [MAX_K]f64 = .{0.0} ** MAX_K;
+    if (total > 0) {
+        for (0..K) |i| {
+            freq[i] = @as(f64, @floatFromInt(counts[i])) / @as(f64, @floatFromInt(total));
+        }
+    } else {
+        // All residues were out-of-range; use uniform.
+        const uniform_p = 1.0 / @as(f64, @floatFromInt(K));
+        for (0..K) |i| freq[i] = uniform_p;
+    }
+
+    // Generate new sequence.
+    const result = try allocator.alloc(u8, dsq.len);
+    for (0..dsq.len) |i| {
+        result[i] = @intCast(rng.choose(freq[0..K]));
+    }
+    return result;
+}
+
+/// Generate a random sequence preserving 1st-order (di-residue) Markov transitions.
+///
+/// Counts the transition matrix T[a][b] from consecutive pairs in `dsq`,
+/// normalizes each row to transition probabilities, then generates a new
+/// sequence: the first residue is sampled from the initial distribution,
+/// each subsequent residue is sampled from P[prev][.].
+/// The caller owns the returned slice and must free it with `allocator`.
+pub fn markov1(allocator: Allocator, rng: *Random, dsq: []const u8, K: usize) ![]u8 {
+    if (dsq.len == 0) return try allocator.alloc(u8, 0);
+
+    // Count initial residue frequencies and transition matrix.
+    var f_counts: [MAX_K]u64 = .{0} ** MAX_K;
+    var f_total: u64 = 0;
+    var T: [MAX_K][MAX_K]u64 = .{.{0} ** MAX_K} ** MAX_K;
+
+    for (dsq) |code| {
+        if (code < K) {
+            f_counts[code] += 1;
+            f_total += 1;
+        }
+    }
+
+    for (0..dsq.len - 1) |pos| {
+        const a = dsq[pos];
+        const b = dsq[pos + 1];
+        if (a < K and b < K) {
+            T[a][b] += 1;
+        }
+    }
+
+    // Normalize initial distribution.
+    var f: [MAX_K]f64 = .{0.0} ** MAX_K;
+    if (f_total > 0) {
+        for (0..K) |i| {
+            f[i] = @as(f64, @floatFromInt(f_counts[i])) / @as(f64, @floatFromInt(f_total));
+        }
+    } else {
+        const uniform_p = 1.0 / @as(f64, @floatFromInt(K));
+        for (0..K) |i| f[i] = uniform_p;
+    }
+
+    // Normalize each row of T to transition probabilities P[a][.].
+    var P: [MAX_K][MAX_K]f64 = .{.{0.0} ** MAX_K} ** MAX_K;
+    for (0..K) |a| {
+        var row_total: u64 = 0;
+        for (0..K) |b| row_total += T[a][b];
+        if (row_total > 0) {
+            for (0..K) |b| {
+                P[a][b] = @as(f64, @floatFromInt(T[a][b])) / @as(f64, @floatFromInt(row_total));
+            }
+        } else {
+            // No transitions observed from this residue; fall back to initial distribution.
+            for (0..K) |b| P[a][b] = f[b];
+        }
+    }
+
+    // Generate sequence.
+    const result = try allocator.alloc(u8, dsq.len);
+
+    // First residue: sample from initial distribution.
+    result[0] = @intCast(rng.choose(f[0..K]));
+
+    // Subsequent residues: sample from transition row of previous residue.
+    for (1..dsq.len) |i| {
+        const prev: usize = result[i - 1];
+        result[i] = @intCast(rng.choose(P[prev][0..K]));
+    }
+
+    return result;
+}
+
 // --- Tests ---
 
 test "randomIid: length and all codes < K for DNA" {
@@ -285,4 +394,121 @@ test "reproducibility: different seeds produce different sequences" {
 
     // Extremely unlikely to match by chance with length 50.
     try std.testing.expect(!std.mem.eql(u8, seq1.dsq, seq2.dsq));
+}
+
+test "markov0: preserves mono-residue composition" {
+    const allocator = std.testing.allocator;
+    var rng = Random.init(12345);
+
+    // Create a DNA sequence with known biased composition: heavy on A (0) and T (3).
+    var input: [2000]u8 = undefined;
+    for (0..2000) |i| {
+        input[i] = switch (i % 10) {
+            0, 1, 2, 3 => 0, // 40% A
+            4, 5, 6 => 1, // 30% C
+            7, 8 => 2, // 20% G
+            9 => 3, // 10% T
+            else => unreachable,
+        };
+    }
+
+    const result = try markov0(allocator, &rng, &input, 4);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 2000), result.len);
+
+    // Count composition in result.
+    var counts = [_]usize{0} ** 4;
+    for (result) |code| {
+        try std.testing.expect(code < 4);
+        counts[code] += 1;
+    }
+
+    // Expected: ~800 A, ~600 C, ~400 G, ~200 T. Tolerate +-80 (~4%).
+    try std.testing.expect(counts[0] > 700 and counts[0] < 900);
+    try std.testing.expect(counts[1] > 500 and counts[1] < 700);
+    try std.testing.expect(counts[2] > 300 and counts[2] < 500);
+    try std.testing.expect(counts[3] > 120 and counts[3] < 280);
+}
+
+test "markov0: empty sequence returns empty" {
+    const allocator = std.testing.allocator;
+    var rng = Random.init(99);
+    const empty: []const u8 = &.{};
+    const result = try markov0(allocator, &rng, empty, 4);
+    defer allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "markov0: single residue" {
+    const allocator = std.testing.allocator;
+    var rng = Random.init(77);
+    const input = [_]u8{2};
+    const result = try markov0(allocator, &rng, &input, 4);
+    defer allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    // Only residue 2 was observed, so output must be 2.
+    try std.testing.expectEqual(@as(u8, 2), result[0]);
+}
+
+test "markov1: preserves di-residue transitions" {
+    const allocator = std.testing.allocator;
+    var rng = Random.init(54321);
+
+    // Create a sequence with a strong pattern: alternating 0-1-0-1-...
+    // This creates strong transitions: 0->1 and 1->0.
+    var input: [2000]u8 = undefined;
+    for (0..2000) |i| {
+        input[i] = @intCast(i % 2);
+    }
+
+    const result = try markov1(allocator, &rng, &input, 4);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 2000), result.len);
+
+    // Count transitions in the result.
+    var T_result = [_][4]usize{.{0} ** 4} ** 4;
+    for (0..result.len - 1) |pos| {
+        T_result[result[pos]][result[pos + 1]] += 1;
+    }
+
+    // The input has transitions: 0->1 (999), 1->0 (1000).
+    // The result should overwhelmingly consist of 0->1 and 1->0 transitions.
+    const dominant = T_result[0][1] + T_result[1][0];
+    try std.testing.expect(dominant > 1900);
+}
+
+test "markov1: empty sequence returns empty" {
+    const allocator = std.testing.allocator;
+    var rng = Random.init(88);
+    const empty: []const u8 = &.{};
+    const result = try markov1(allocator, &rng, empty, 4);
+    defer allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "markov1: single residue returns single residue" {
+    const allocator = std.testing.allocator;
+    var rng = Random.init(66);
+    const input = [_]u8{3};
+    const result = try markov1(allocator, &rng, &input, 4);
+    defer allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    // Only residue 3 observed, so output must be 3.
+    try std.testing.expectEqual(@as(u8, 3), result[0]);
+}
+
+test "markov1: skips out-of-range codes" {
+    const allocator = std.testing.allocator;
+    var rng = Random.init(55);
+    // Sequence with some codes >= K (treated as gaps/degenerate).
+    const input = [_]u8{ 0, 1, 255, 0, 1, 0, 1, 254, 0, 1 };
+    const result = try markov1(allocator, &rng, &input, 4);
+    defer allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 10), result.len);
+    // All output codes must be < K.
+    for (result) |code| {
+        try std.testing.expect(code < 4);
+    }
 }
