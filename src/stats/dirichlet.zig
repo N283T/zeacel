@@ -47,6 +47,9 @@ pub const Dirichlet = struct {
     ///
     /// p[i] == 0 terms with alpha[i] > 1 contribute -inf; p[i] == 0 with
     /// alpha[i] == 1 contributes 0 (consistent with Laplace prior).
+    /// Compute log PDF using reduced-dimension semantics matching Easel:
+    /// when p[i] == 0, skip that dimension entirely (don't accumulate
+    /// alpha[i] into sum_alpha or lgamma(alpha[i]) into sum_lgamma).
     pub fn logPdf(self: Dirichlet, p: []const f64) f64 {
         const k = self.alpha.len;
         std.debug.assert(p.len == k);
@@ -56,9 +59,9 @@ pub const Dirichlet = struct {
         var sum_log: f64 = 0;
 
         for (0..k) |i| {
-            sum_alpha += self.alpha[i];
-            sum_lgamma += math.lgamma(f64, self.alpha[i]);
             if (p[i] > 0) {
+                sum_alpha += self.alpha[i];
+                sum_lgamma += math.lgamma(f64, self.alpha[i]);
                 sum_log += (self.alpha[i] - 1.0) * @log(p[i]);
             }
         }

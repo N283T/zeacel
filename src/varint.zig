@@ -7,8 +7,12 @@
 const std = @import("std");
 
 /// Encode a u64 value as a Google varint (base-128, little-endian).
-/// Returns the number of bytes written.
-pub fn encode(value: u64, buf: []u8) usize {
+/// Returns the number of bytes written, or error.BufferTooSmall if
+/// the buffer is not large enough (up to 10 bytes needed for u64 max).
+pub fn encode(value: u64, buf: []u8) error{BufferTooSmall}!usize {
+    const required = encodedSize(value);
+    if (buf.len < required) return error.BufferTooSmall;
+
     var v = value;
     var i: usize = 0;
     while (v >= 0x80) {
@@ -153,7 +157,7 @@ pub fn riceDecode(code: u64, k: u5) !struct { value: u64, bits: u6 } {
 
 test "encode/decode: zero" {
     var buf: [10]u8 = undefined;
-    const n = encode(0, &buf);
+    const n = try encode(0, &buf);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqual(@as(u8, 0), buf[0]);
 
@@ -164,7 +168,7 @@ test "encode/decode: zero" {
 
 test "encode/decode: small value (127)" {
     var buf: [10]u8 = undefined;
-    const n = encode(127, &buf);
+    const n = try encode(127, &buf);
     try std.testing.expectEqual(@as(usize, 1), n);
 
     const result = try decode(buf[0..n]);
@@ -173,7 +177,7 @@ test "encode/decode: small value (127)" {
 
 test "encode/decode: 128 (needs 2 bytes)" {
     var buf: [10]u8 = undefined;
-    const n = encode(128, &buf);
+    const n = try encode(128, &buf);
     try std.testing.expectEqual(@as(usize, 2), n);
 
     const result = try decode(buf[0..n]);
@@ -183,7 +187,7 @@ test "encode/decode: 128 (needs 2 bytes)" {
 test "encode/decode: large value" {
     var buf: [10]u8 = undefined;
     const val: u64 = 123456789;
-    const n = encode(val, &buf);
+    const n = try encode(val, &buf);
 
     const result = try decode(buf[0..n]);
     try std.testing.expectEqual(val, result.value);
@@ -192,10 +196,29 @@ test "encode/decode: large value" {
 test "encode/decode: max u64" {
     var buf: [10]u8 = undefined;
     const val: u64 = std.math.maxInt(u64);
-    const n = encode(val, &buf);
+    const n = try encode(val, &buf);
 
     const result = try decode(buf[0..n]);
     try std.testing.expectEqual(val, result.value);
+}
+
+test "encode: buffer too small returns error" {
+    // u64 max needs 10 bytes; a 9-byte buffer should fail
+    var buf: [9]u8 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, encode(std.math.maxInt(u64), &buf));
+
+    // 128 needs 2 bytes; a 1-byte buffer should fail
+    var buf1: [1]u8 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, encode(128, &buf1));
+
+    // 0 needs 1 byte; a 0-length buffer should fail
+    var buf0: [0]u8 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, encode(0, &buf0));
+
+    // 127 fits in 1 byte; a 1-byte buffer should succeed
+    var buf_ok: [1]u8 = undefined;
+    const n = try encode(127, &buf_ok);
+    try std.testing.expectEqual(@as(usize, 1), n);
 }
 
 test "encodedSize" {

@@ -265,14 +265,21 @@ pub const Msa = struct {
         return map;
     }
 
-    /// Compute a 32-bit checksum over alignment data only (not names/annotation).
+    /// Compute a 32-bit checksum over alignment data using Jenkins one-at-a-time hash.
+    /// Matches Easel's esl_msa_Checksum().
     pub fn checksum(self: Msa) u32 {
         var val: u32 = 0;
         for (self.seqs) |seq| {
             for (seq) |code| {
-                val = val *% 31 +% @as(u32, code);
+                val +%= @as(u32, code);
+                val +%= val << 10;
+                val ^= val >> 6;
             }
         }
+        // Finalization
+        val +%= val << 3;
+        val ^= val >> 11;
+        val +%= val << 15;
         return val;
     }
 
@@ -590,7 +597,8 @@ pub const Msa = struct {
         for (0..self.alen) |col| {
             var has_gap = false;
             for (0..self.names.len) |seq| {
-                if (self.abc.isGap(self.seqs[seq][col])) {
+                const code = self.seqs[seq][col];
+                if (self.abc.isGap(code) or self.abc.isMissing(code)) {
                     has_gap = true;
                     break;
                 }
@@ -628,13 +636,41 @@ pub const Msa = struct {
             try self.abc.reverseComplement(new_seqs[i]);
         }
 
-        return Msa{
+        var result = Msa{
             .names = new_names,
             .seqs = new_seqs,
             .alen = self.alen,
             .abc = self.abc,
             .allocator = self.allocator,
         };
+
+        // Reverse annotation strings (reference, consensus_ss).
+        if (self.reference) |ref| {
+            const rev = try self.allocator.dupe(u8, ref);
+            std.mem.reverse(u8, rev);
+            result.reference = rev;
+        }
+        if (self.consensus_ss) |ss| {
+            const rev = try self.allocator.dupe(u8, ss);
+            // Reverse bytes and swap WUSS base-pair characters.
+            std.mem.reverse(u8, rev);
+            for (rev) |*ch| {
+                ch.* = switch (ch.*) {
+                    '<' => '>',
+                    '>' => '<',
+                    '(' => ')',
+                    ')' => '(',
+                    '[' => ']',
+                    ']' => '[',
+                    '{' => '}',
+                    '}' => '{',
+                    else => ch.*,
+                };
+            }
+            result.consensus_ss = rev;
+        }
+
+        return result;
     }
 
     /// Convert all degenerate residue codes to the unknown symbol (X/N).

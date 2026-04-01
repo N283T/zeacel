@@ -94,3 +94,81 @@ test "newton: cos(x) with x0=1.5 → root at π/2" {
     const root = try newton(cos_x, neg_sin_x, 1.5, 1e-10, 100);
     try std.testing.expectApproxEqAbs(math.pi / 2.0, root, 1e-9);
 }
+
+// ── Context-parameterized variants ──────────────────────────────────────────
+
+/// Bisection with a context parameter, allowing parameterized functions.
+/// `Ctx` is any type; `f` receives the context alongside x.
+pub fn bisectCtx(
+    comptime Ctx: type,
+    f: *const fn (f64, Ctx) f64,
+    ctx: Ctx,
+    a: f64,
+    b: f64,
+    tol: f64,
+    max_iter: usize,
+) !f64 {
+    var lo = a;
+    var hi = b;
+    var f_lo = f(lo, ctx);
+
+    if (f_lo * f(hi, ctx) > 0) return error.BracketNotFound;
+
+    for (0..max_iter) |_| {
+        const mid = (lo + hi) / 2.0;
+        const f_mid = f(mid, ctx);
+        if (@abs(f_mid) < tol or (hi - lo) / 2.0 < tol) return mid;
+        if (f_lo * f_mid < 0) {
+            hi = mid;
+        } else {
+            lo = mid;
+            f_lo = f_mid;
+        }
+    }
+    return error.DidNotConverge;
+}
+
+/// Newton-Raphson with a context parameter.
+pub fn newtonCtx(
+    comptime Ctx: type,
+    f: *const fn (f64, Ctx) f64,
+    df: *const fn (f64, Ctx) f64,
+    ctx: Ctx,
+    x0: f64,
+    tol: f64,
+    max_iter: usize,
+) !f64 {
+    var x = x0;
+    for (0..max_iter) |_| {
+        const fx = f(x, ctx);
+        if (@abs(fx) < tol) return x;
+        const dfx = df(x, ctx);
+        if (dfx == 0.0) return error.DidNotConverge;
+        x -= fx / dfx;
+    }
+    return error.DidNotConverge;
+}
+
+// Context-parameterized tests
+
+const QuadParams = struct { a: f64, b: f64, c: f64 };
+
+fn quadFunc(x: f64, p: QuadParams) f64 {
+    return p.a * x * x + p.b * x + p.c;
+}
+
+fn quadDeriv(x: f64, p: QuadParams) f64 {
+    return 2.0 * p.a * x + p.b;
+}
+
+test "bisectCtx: parameterized quadratic" {
+    const params = QuadParams{ .a = 1.0, .b = 0.0, .c = -9.0 }; // x^2 - 9, root at 3
+    const root = try bisectCtx(QuadParams, quadFunc, params, 0.0, 5.0, 1e-10, 200);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), root, 1e-9);
+}
+
+test "newtonCtx: parameterized quadratic" {
+    const params = QuadParams{ .a = 1.0, .b = 0.0, .c = -9.0 };
+    const root = try newtonCtx(QuadParams, quadFunc, quadDeriv, params, 4.0, 1e-10, 100);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), root, 1e-9);
+}
