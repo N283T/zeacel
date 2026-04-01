@@ -153,6 +153,75 @@ pub fn riceDecode(code: u64, k: u5) !struct { value: u64, bits: u6 } {
     return .{ .value = v, .bits = n };
 }
 
+// --- Elias Delta coding ---
+
+/// Encode a positive integer (>= 1) using Elias Delta code.
+/// Returns the codeword (right-flushed in u64) and its bit length.
+pub fn eliasDeltaEncode(v: u64) !struct { code: u64, bits: u6 } {
+    if (v == 0) return error.Overflow;
+
+    // L = number of bits in binary representation of v (floor(log2(v)) + 1)
+    var l: u6 = 0;
+    var tmp = v;
+    while (tmp > 0) {
+        l += 1;
+        tmp >>= 1;
+    }
+
+    // LL = number of bits in binary representation of L
+    var ll: u6 = 0;
+    var tmp2: u64 = l;
+    while (tmp2 > 0) {
+        ll += 1;
+        tmp2 >>= 1;
+    }
+
+    // Total bits = (ll-1) + ll + (l-1) = 2*ll + l - 2
+    const n_wide: u8 = @as(u8, 2) * @as(u8, ll) + @as(u8, l) - 2;
+    if (n_wide > 64) return error.Overflow;
+    const n: u6 = @intCast(n_wide);
+
+    // Build code: write L in LL bits, then the lower (L-1) bits of v
+    // The (LL-1) leading zeros are implicit from the bit width
+    var code: u64 = @as(u64, l);
+    code = (code << (@as(u6, l) - 1)) | (v & ((@as(u64, 1) << (@as(u6, l) - 1)) - 1));
+
+    return .{ .code = code, .bits = n };
+}
+
+/// Decode an Elias Delta codeword from the high-order (left-flushed) bits of `code`.
+/// Returns the decoded value and the number of bits consumed.
+pub fn eliasDeltaDecode(code: u64) !struct { value: u64, bits: u6 } {
+    if (code == 0) return error.UnexpectedEndOfInput;
+
+    // Count leading zero bits to get LL-1
+    var leading_zeros: u6 = 0;
+    while (leading_zeros < 63 and (code & (@as(u64, 1) << (63 - leading_zeros))) == 0) {
+        leading_zeros += 1;
+    }
+    const ll: u6 = leading_zeros + 1;
+
+    // Read LL bits starting at position (63 - leading_zeros): this is L
+    // The LL bits occupy positions [63-leading_zeros .. 63-leading_zeros-(ll-1)]
+    // i.e., shift right by (64 - leading_zeros - ll) to align to LSB
+    const l_shift: u7 = @as(u7, 64) - @as(u7, leading_zeros) - @as(u7, ll);
+    const l: u6 = @intCast((code >> @as(u6, @intCast(l_shift))) & ((@as(u64, 1) << ll) - 1));
+
+    if (l == 0) return error.UnexpectedEndOfInput;
+
+    // Total bits consumed
+    const n_wide: u8 = @as(u8, 2) * @as(u8, ll) + @as(u8, l) - 2;
+    if (n_wide > 64) return error.Overflow;
+    const n: u6 = @intCast(n_wide);
+
+    // Read the lower (L-1) bits of v (the leading 1 is implicit)
+    const suffix_shift: u7 = @as(u7, 64) - @as(u7, n);
+    const suffix = (code >> @as(u6, @intCast(suffix_shift))) & ((@as(u64, 1) << (@as(u6, l) - 1)) - 1);
+    const value: u64 = (@as(u64, 1) << (@as(u6, l) - 1)) | suffix;
+
+    return .{ .value = value, .bits = n };
+}
+
 // --- Tests ---
 
 test "encode/decode: zero" {
@@ -295,4 +364,50 @@ test "rice: known code for v=0 k=2 is 000 (3 bits)" {
     const enc = try riceEncode(0, 2);
     try std.testing.expectEqual(@as(u64, 0), enc.code);
     try std.testing.expectEqual(@as(u6, 3), enc.bits);
+}
+
+test "eliasDelta: encode/decode round-trip small values" {
+    const test_values = [_]u64{ 1, 2, 3, 4, 5, 13, 100 };
+    for (test_values) |v| {
+        const enc = try eliasDeltaEncode(v);
+        const left_flushed = leftFlush(enc.code, enc.bits);
+        const dec = try eliasDeltaDecode(left_flushed);
+        try std.testing.expectEqual(v, dec.value);
+        try std.testing.expectEqual(enc.bits, dec.bits);
+    }
+}
+
+test "eliasDelta: known bit patterns" {
+    // N=1: L=1, LL=1 → code=1, bits=1
+    const e1 = try eliasDeltaEncode(1);
+    try std.testing.expectEqual(@as(u64, 1), e1.code);
+    try std.testing.expectEqual(@as(u6, 1), e1.bits);
+
+    // N=2: L=2, LL=2 → code=0b0100 (4), bits=4
+    const e2 = try eliasDeltaEncode(2);
+    try std.testing.expectEqual(@as(u64, 0b0100), e2.code);
+    try std.testing.expectEqual(@as(u6, 4), e2.bits);
+
+    // N=3: L=2, LL=2 → code=0b0101 (5), bits=4
+    const e3 = try eliasDeltaEncode(3);
+    try std.testing.expectEqual(@as(u64, 0b0101), e3.code);
+    try std.testing.expectEqual(@as(u6, 4), e3.bits);
+
+    // N=4: L=3, LL=2 → code=0b01100, bits=5
+    const e4 = try eliasDeltaEncode(4);
+    try std.testing.expectEqual(@as(u64, 0b01100), e4.code);
+    try std.testing.expectEqual(@as(u6, 5), e4.bits);
+
+    // N=13: L=4, LL=3 → code=0b00100101, bits=8
+    const e13 = try eliasDeltaEncode(13);
+    try std.testing.expectEqual(@as(u64, 0b00100101), e13.code);
+    try std.testing.expectEqual(@as(u6, 8), e13.bits);
+}
+
+test "eliasDelta: encode(0) returns error.Overflow" {
+    try std.testing.expectError(error.Overflow, eliasDeltaEncode(0));
+}
+
+test "eliasDelta: decode(0) returns error.UnexpectedEndOfInput" {
+    try std.testing.expectError(error.UnexpectedEndOfInput, eliasDeltaDecode(0));
 }
