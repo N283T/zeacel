@@ -1,7 +1,9 @@
-// Binary sequence database format for fast sequential reading.
-// Layout:
-//   Header (32 bytes): magic, version, alphabet_type, padding, num_sequences, total_residues, reserved
-//   Per-sequence records: name_len, seq_len, name bytes, dsq bytes
+// dsqdata — binary sequence database format with dual-format support.
+//
+// DsqData is a tagged union that dispatches to either the native zeasel
+// format (single-file ZSQD) or the Easel format (4-file .dsqi/.dsqm/.dsqs).
+// The open() constructor auto-detects the format. Writing always produces
+// zeasel ZSQD format.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -9,11 +11,23 @@ const Alphabet = @import("alphabet.zig").Alphabet;
 const alphabet_mod = @import("alphabet.zig");
 const Sequence = @import("sequence.zig").Sequence;
 
-pub const easel = @import("dsqdata/easel.zig");
+// --- Sub-module re-exports ---
+
+pub const zeasel_dsqdata = @import("dsqdata/zeasel.zig");
+pub const easel_dsqdata = @import("dsqdata/easel.zig");
 pub const pack = @import("dsqdata/pack.zig");
 
-pub const MAGIC = "ZSQD".*;
-pub const VERSION: u32 = 1;
+// --- Backwards-compatible API (delegates to zeasel format) ---
+
+pub const write = zeasel_dsqdata.write;
+pub const readHeader = zeasel_dsqdata.readHeader;
+pub const readNext = zeasel_dsqdata.readNext;
+pub const readAll = zeasel_dsqdata.readAll;
+pub const PrefetchReader = zeasel_dsqdata.PrefetchReader;
+pub const MAGIC = zeasel_dsqdata.MAGIC;
+pub const VERSION = zeasel_dsqdata.VERSION;
+
+// --- Shared Header type ---
 
 pub const Header = struct {
     alphabet_type: alphabet_mod.AlphabetType,
@@ -21,215 +35,151 @@ pub const Header = struct {
     total_residues: u64,
 };
 
-/// Write sequences to a binary dsqdata stream.
-pub fn write(dest: std.io.AnyWriter, abc: *const Alphabet, seqs: []const Sequence) !void {
-    // Header: magic (4) + version (4) + alphabet_type (1) + padding (3) +
-    //         num_sequences (8) + total_residues (8) + reserved (4) = 32 bytes
-    try dest.writeAll(&MAGIC);
-    try dest.writeInt(u32, VERSION, .little);
-    try dest.writeByte(@intFromEnum(abc.kind));
-    try dest.writeAll(&[_]u8{ 0, 0, 0 }); // padding
+// --- ZeaselStream: internal helper for streaming zeasel format through the union ---
 
-    var total_res: u64 = 0;
-    for (seqs) |s| total_res += @intCast(s.len());
-    try dest.writeInt(u64, @intCast(seqs.len), .little);
-    try dest.writeInt(u64, total_res, .little);
-    try dest.writeAll(&[_]u8{ 0, 0, 0, 0 }); // reserved
+const ZeaselStream = struct {
+    file: std.fs.File,
+    hdr: Header,
 
-    // Sequence records
-    for (seqs) |seq| {
-        try dest.writeInt(u32, @intCast(seq.name.len), .little);
-        try dest.writeInt(u64, @intCast(seq.dsq.len), .little);
-        try dest.writeAll(seq.name);
-        try dest.writeAll(seq.dsq);
+    fn open(file: std.fs.File) !ZeaselStream {
+        // File is already positioned past the 4-byte magic. Read the rest of
+        // the 32-byte header (28 remaining bytes).
+        const reader = file.deprecatedReader();
+
+        const version = try reader.readInt(u32, .little);
+        if (version != zeasel_dsqdata.VERSION) return error.UnsupportedVersion;
+
+        const abc_byte = try reader.readByte();
+
+        var padding: [3]u8 = undefined;
+        _ = try reader.readAll(&padding);
+
+        const num_seqs = try reader.readInt(u64, .little);
+        const total_res = try reader.readInt(u64, .little);
+
+        var reserved: [4]u8 = undefined;
+        _ = try reader.readAll(&reserved);
+
+        return ZeaselStream{
+            .file = file,
+            .hdr = Header{
+                .alphabet_type = @enumFromInt(abc_byte),
+                .num_sequences = num_seqs,
+                .total_residues = total_res,
+            },
+        };
     }
-}
 
-/// Read the 32-byte header from a dsqdata stream.
-pub fn readHeader(src: std.io.AnyReader) !Header {
-    var magic: [4]u8 = undefined;
-    _ = try src.readAll(&magic);
-    if (!std.mem.eql(u8, &magic, &MAGIC)) return error.InvalidFormat;
-
-    const version = try src.readInt(u32, .little);
-    if (version != VERSION) return error.UnsupportedVersion;
-
-    const abc_byte = try src.readByte();
-
-    var padding: [3]u8 = undefined;
-    _ = try src.readAll(&padding);
-
-    const num_seqs = try src.readInt(u64, .little);
-    const total_res = try src.readInt(u64, .little);
-
-    var reserved: [4]u8 = undefined;
-    _ = try src.readAll(&reserved);
-
-    return Header{
-        .alphabet_type = @enumFromInt(abc_byte),
-        .num_sequences = num_seqs,
-        .total_residues = total_res,
-    };
-}
-
-/// Read the next sequence from a dsqdata stream.
-/// Returns null at end of stream. Caller owns the returned Sequence.
-pub fn readNext(allocator: Allocator, src: std.io.AnyReader, abc: *const Alphabet) !?Sequence {
-    const name_len = src.readInt(u32, .little) catch |e| {
-        if (e == error.EndOfStream) return null;
-        return e;
-    };
-    const seq_len = try src.readInt(u64, .little);
-
-    const name = try allocator.alloc(u8, name_len);
-    errdefer allocator.free(name);
-    _ = try src.readAll(name);
-
-    const dsq = try allocator.alloc(u8, seq_len);
-    errdefer allocator.free(dsq);
-    _ = try src.readAll(dsq);
-
-    return Sequence{
-        .name = name,
-        .accession = null,
-        .description = null,
-        .taxonomy_id = null,
-        .dsq = dsq,
-        .secondary_structure = null,
-        .source = null,
-        .abc = abc,
-        .allocator = allocator,
-    };
-}
-
-/// Read all sequences from a dsqdata stream (after the header has been read).
-/// Caller owns the returned slice and each Sequence in it.
-pub fn readAll(allocator: Allocator, src: std.io.AnyReader, abc: *const Alphabet) ![]Sequence {
-    var seqs = std.ArrayList(Sequence){};
-    errdefer {
-        for (seqs.items) |*s| s.deinit();
-        seqs.deinit(allocator);
+    fn next(self: *ZeaselStream, allocator: Allocator, abc: *const Alphabet) !?Sequence {
+        return zeasel_dsqdata.readNext(allocator, self.file.deprecatedReader().any(), abc);
     }
-    while (try readNext(allocator, src, abc)) |seq| {
-        try seqs.append(allocator, seq);
+
+    fn deinit(self: *ZeaselStream) void {
+        self.file.close();
     }
-    return seqs.toOwnedSlice(allocator);
-}
+};
 
-// --- Threaded prefetch reader ---
+// --- DsqData tagged union ---
 
-const SequenceBlock = @import("sequence.zig").SequenceBlock;
-const WorkQueue = @import("threads.zig").WorkQueue;
+pub const DsqData = union(enum) {
+    zeasel: ZeaselStream,
+    easel: easel_dsqdata.EaselDsqData,
 
-/// A threaded dsqdata reader that prefetches sequence blocks in a background
-/// loader thread, handing them to the main thread via a work queue.
-/// Must be heap-allocated (use create/destroy) because the loader thread
-/// holds a pointer to the queue.
-pub const PrefetchReader = struct {
-    queue: WorkQueue(*SequenceBlock),
-    loader: ?std.Thread,
-    allocator: Allocator,
-
-    /// Create a PrefetchReader on the heap and spawn the loader thread.
-    /// The header must already have been read from src.
-    /// Caller must call destroy() when done.
-    pub fn create(allocator: Allocator, src: std.io.AnyReader, abc: *const Alphabet, block_size: usize) !*PrefetchReader {
-        const self = try allocator.create(PrefetchReader);
-        errdefer allocator.destroy(self);
-
-        self.* = PrefetchReader{
-            .queue = try WorkQueue(*SequenceBlock).init(allocator, 64),
-            .loader = null,
-            .allocator = allocator,
+    /// Open a dsqdata database, auto-detecting format from the file contents.
+    ///
+    /// Detection logic:
+    ///   1. Try opening `path` as a file and read the first 4 bytes.
+    ///   2. If magic == "ZSQD" -> zeasel format (single file, keep open for streaming).
+    ///   3. If magic == 0xc4d3d1b1 (Easel .dsqi magic) -> easel format; strip ".dsqi"
+    ///      suffix if present to get the basename.
+    ///   4. If file doesn't exist, try path ++ ".dsqi" -> easel basename.
+    ///   5. Otherwise -> error.InvalidFormat.
+    pub fn open(allocator: Allocator, path: []const u8) !DsqData {
+        // Step 1: Try opening path directly.
+        const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+            if (err == error.FileNotFound) {
+                // Step 4: Try path ++ ".dsqi" to detect easel basename.
+                const dsqi_path = try std.fmt.allocPrint(allocator, "{s}.dsqi", .{path});
+                defer allocator.free(dsqi_path);
+                std.fs.cwd().access(dsqi_path, .{}) catch return error.FileNotFound;
+                // .dsqi exists, so path is the easel basename.
+                return DsqData{ .easel = try easel_dsqdata.EaselDsqData.open(allocator, path) };
+            }
+            return err;
         };
 
-        const ctx = try allocator.create(LoaderCtx);
-        errdefer allocator.destroy(ctx);
-        ctx.* = LoaderCtx{
-            .reader = src,
-            .queue = &self.queue,
-            .allocator = allocator,
-            .abc = abc,
-            .block_size = block_size,
+        // Step 2/3: Read first 4 bytes to detect format.
+        var magic: [4]u8 = undefined;
+        const n = file.preadAll(&magic, 0) catch {
+            file.close();
+            return error.InvalidFormat;
         };
+        if (n != 4) {
+            // File too small to have a valid magic. Could be a stub file for
+            // an Easel database. Try path ++ ".dsqi" as fallback.
+            file.close();
+            const dsqi_path = try std.fmt.allocPrint(allocator, "{s}.dsqi", .{path});
+            defer allocator.free(dsqi_path);
+            std.fs.cwd().access(dsqi_path, .{}) catch return error.InvalidFormat;
+            return DsqData{ .easel = try easel_dsqdata.EaselDsqData.open(allocator, path) };
+        }
 
-        self.loader = try std.Thread.spawn(.{}, loaderThread, .{ctx});
-        return self;
-    }
-
-    /// Read the next block of sequences. Returns null when all sequences
-    /// have been read. Caller should call recycle() on each returned block.
-    pub fn read(self: *PrefetchReader) ?*SequenceBlock {
-        return self.queue.receive();
-    }
-
-    /// Recycle a used block by freeing its sequences and the block itself.
-    pub fn recycle(self: *PrefetchReader, block: *SequenceBlock) void {
-        block.deinit();
-        self.allocator.destroy(block);
-    }
-
-    /// Destroy the reader, waiting for the loader thread to finish.
-    pub fn destroy(self: *PrefetchReader) void {
-        if (self.loader) |t| t.join();
-        self.queue.deinit();
-        self.allocator.destroy(self);
-    }
-
-    const LoaderCtx = struct {
-        reader: std.io.AnyReader,
-        queue: *WorkQueue(*SequenceBlock),
-        allocator: Allocator,
-        abc: *const Alphabet,
-        block_size: usize,
-    };
-
-    fn loaderThread(ctx: *LoaderCtx) void {
-        const alloc = ctx.allocator;
-        const q = ctx.queue;
-        const abc = ctx.abc;
-        const bs = ctx.block_size;
-        const rdr = ctx.reader;
-        alloc.destroy(ctx);
-
-        while (true) {
-            const block = alloc.create(SequenceBlock) catch {
-                q.close();
-                return;
+        // Check for zeasel ZSQD magic.
+        if (std.mem.eql(u8, &magic, &zeasel_dsqdata.MAGIC)) {
+            // Seek past the 4-byte magic that we already read via pread.
+            file.seekTo(4) catch {
+                file.close();
+                return error.InvalidFormat;
             };
-            block.* = SequenceBlock.initCapacity(alloc, bs) catch {
-                alloc.destroy(block);
-                q.close();
-                return;
-            };
+            return DsqData{ .zeasel = ZeaselStream.open(file) catch |err| {
+                file.close();
+                return err;
+            } };
+        }
 
-            var count: usize = 0;
-            while (count < bs) {
-                const seq = readNext(alloc, rdr, abc) catch break;
-                if (seq) |s| {
-                    block.add(s) catch break;
-                    count += 1;
-                } else break;
-            }
+        // Check for Easel .dsqi magic.
+        const magic_u32 = std.mem.readInt(u32, &magic, .little);
+        if (magic_u32 == 0xc4d3d1b1) {
+            file.close();
+            // Derive the basename by stripping ".dsqi" suffix if present.
+            const basename = if (std.mem.endsWith(u8, path, ".dsqi"))
+                path[0 .. path.len - 5]
+            else
+                path;
+            // Need a mutable copy for EaselDsqData.open since it allocPrints.
+            return DsqData{ .easel = try easel_dsqdata.EaselDsqData.open(allocator, basename) };
+        }
 
-            if (count == 0) {
-                block.deinit();
-                alloc.destroy(block);
-                q.close();
-                return;
-            }
+        file.close();
+        return error.InvalidFormat;
+    }
 
-            q.send(block) catch {
-                block.deinit();
-                alloc.destroy(block);
-                q.close();
-                return;
-            };
+    /// Read the next sequence from the database.
+    /// Returns null at end of stream. Caller owns the returned Sequence.
+    pub fn next(self: *DsqData, allocator: Allocator, abc: *const Alphabet) !?Sequence {
+        switch (self.*) {
+            .zeasel => |*z| return z.next(allocator, abc),
+            .easel => |*e| return e.readNext(allocator, abc),
+        }
+    }
 
-            if (count < bs) {
-                q.close();
-                return;
-            }
+    /// Return the header metadata for this database.
+    pub fn header(self: DsqData) Header {
+        switch (self) {
+            .zeasel => |z| return z.hdr,
+            .easel => |e| return Header{
+                .alphabet_type = e.alphabet_type,
+                .num_sequences = e.num_sequences,
+                .total_residues = e.total_residues,
+            },
+        }
+    }
+
+    /// Close all file handles and release resources.
+    pub fn deinit(self: *DsqData) void {
+        switch (self.*) {
+            .zeasel => |*z| z.deinit(),
+            .easel => |*e| e.deinit(),
         }
     }
 };
@@ -237,160 +187,141 @@ pub const PrefetchReader = struct {
 // --- Sub-module test references ---
 
 test {
-    _ = easel;
+    _ = zeasel_dsqdata;
+    _ = easel_dsqdata;
     _ = pack;
 }
 
-// --- Tests ---
+// --- Hub tests ---
 
-test "write and readAll: round trip with 3 DNA sequences" {
+test "DsqData.open: auto-detects zeasel format" {
     const allocator = std.testing.allocator;
 
-    var seq1 = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "ACGT");
+    // Create a zeasel ZSQD file via write().
+    var seq1 = try Sequence.fromText(allocator, &alphabet_mod.dna, "hub_seq", "ACGT");
     defer seq1.deinit();
-    var seq2 = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq2", "TTTTAAAA");
-    defer seq2.deinit();
-    var seq3 = try Sequence.fromText(allocator, &alphabet_mod.dna, "longname", "GCGCGC");
-    defer seq3.deinit();
 
     var buf = std.ArrayList(u8){};
     defer buf.deinit(allocator);
 
-    const originals = [_]Sequence{ seq1, seq2, seq3 };
+    const originals = [_]Sequence{seq1};
     try write(buf.writer(allocator).any(), &alphabet_mod.dna, &originals);
 
-    var fbs = std.io.fixedBufferStream(buf.items);
-    const hdr = try readHeader(fbs.reader().any());
-    const seqs = try readAll(allocator, fbs.reader().any(), &alphabet_mod.dna);
-    defer {
-        for (seqs) |*s| @constCast(s).deinit();
-        allocator.free(seqs);
-    }
+    // Write to a temp file.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zsqd", .data = buf.items });
 
-    try std.testing.expectEqual(@as(usize, 3), seqs.len);
-    try std.testing.expectEqual(hdr.num_sequences, 3);
-    try std.testing.expectEqual(hdr.total_residues, 18); // 4 + 8 + 6
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp_dir.dir.realpath(".", &path_buf);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/test.zsqd", .{dir_path});
+    defer allocator.free(full_path);
 
-    try std.testing.expectEqualStrings("seq1", seqs[0].name);
-    try std.testing.expectEqualSlices(u8, seq1.dsq, seqs[0].dsq);
+    var db = try DsqData.open(allocator, full_path);
+    defer db.deinit();
 
-    try std.testing.expectEqualStrings("seq2", seqs[1].name);
-    try std.testing.expectEqualSlices(u8, seq2.dsq, seqs[1].dsq);
+    // Verify it detected zeasel format.
+    try std.testing.expect(db == .zeasel);
 
-    try std.testing.expectEqualStrings("longname", seqs[2].name);
-    try std.testing.expectEqualSlices(u8, seq3.dsq, seqs[2].dsq);
-}
+    // Verify header.
+    const hdr = db.header();
+    try std.testing.expectEqual(@as(u64, 1), hdr.num_sequences);
+    try std.testing.expectEqual(@as(u64, 4), hdr.total_residues);
 
-test "header: num_sequences, total_residues, alphabet_type" {
-    const allocator = std.testing.allocator;
-
-    var seq1 = try Sequence.fromText(allocator, &alphabet_mod.amino, "prot1", "ACDEF");
-    defer seq1.deinit();
-    var seq2 = try Sequence.fromText(allocator, &alphabet_mod.amino, "prot2", "GHIKLM");
-    defer seq2.deinit();
-
-    var buf = std.ArrayList(u8){};
-    defer buf.deinit(allocator);
-
-    const seqs = [_]Sequence{ seq1, seq2 };
-    try write(buf.writer(allocator).any(), &alphabet_mod.amino, &seqs);
-
-    var fbs = std.io.fixedBufferStream(buf.items);
-    const hdr = try readHeader(fbs.reader().any());
-
-    try std.testing.expectEqual(alphabet_mod.AlphabetType.amino, hdr.alphabet_type);
-    try std.testing.expectEqual(@as(u64, 2), hdr.num_sequences);
-    try std.testing.expectEqual(@as(u64, 11), hdr.total_residues); // 5 + 6
-}
-
-test "empty file: write header only, readNext returns null" {
-    const allocator = std.testing.allocator;
-
-    var buf = std.ArrayList(u8){};
-    defer buf.deinit(allocator);
-
-    try write(buf.writer(allocator).any(), &alphabet_mod.dna, &[_]Sequence{});
-
-    var fbs = std.io.fixedBufferStream(buf.items);
-    const hdr = try readHeader(fbs.reader().any());
-
-    try std.testing.expectEqual(@as(u64, 0), hdr.num_sequences);
-    try std.testing.expectEqual(@as(u64, 0), hdr.total_residues);
-
-    const next = try readNext(allocator, fbs.reader().any(), &alphabet_mod.dna);
-    try std.testing.expect(next == null);
-}
-
-test "invalid magic returns error.InvalidFormat" {
-    const allocator = std.testing.allocator;
-
-    var buf = std.ArrayList(u8){};
-    defer buf.deinit(allocator);
-
-    // Write a valid file first then corrupt the magic
-    try write(buf.writer(allocator).any(), &alphabet_mod.dna, &[_]Sequence{});
-    buf.items[0] = 'X'; // corrupt first byte of magic
-
-    var fbs = std.io.fixedBufferStream(buf.items);
-    try std.testing.expectError(error.InvalidFormat, readHeader(fbs.reader().any()));
-}
-
-test "round trip with amino acid sequences" {
-    const allocator = std.testing.allocator;
-
-    var seq = try Sequence.fromText(allocator, &alphabet_mod.amino, "myprot", "ACDEFGHIKLM");
+    // Read back the sequence.
+    var seq = (try db.next(allocator, &alphabet_mod.dna)).?;
     defer seq.deinit();
+    try std.testing.expectEqualStrings("hub_seq", seq.name);
+    try std.testing.expectEqualSlices(u8, seq1.dsq, seq.dsq);
 
-    var buf = std.ArrayList(u8){};
-    defer buf.deinit(allocator);
-
-    const seqs = [_]Sequence{seq};
-    try write(buf.writer(allocator).any(), &alphabet_mod.amino, &seqs);
-
-    var fbs = std.io.fixedBufferStream(buf.items);
-    _ = try readHeader(fbs.reader().any());
-    const result = try readAll(allocator, fbs.reader().any(), &alphabet_mod.amino);
-    defer {
-        for (result) |*s| @constCast(s).deinit();
-        allocator.free(result);
-    }
-
-    try std.testing.expectEqual(@as(usize, 1), result.len);
-    try std.testing.expectEqualStrings("myprot", result[0].name);
-    try std.testing.expectEqualSlices(u8, seq.dsq, result[0].dsq);
+    // No more sequences.
+    const end = try db.next(allocator, &alphabet_mod.dna);
+    try std.testing.expect(end == null);
 }
 
-test "PrefetchReader: threaded read of 5 sequences in blocks of 2" {
+test "DsqData.open: auto-detects easel format by basename" {
     const allocator = std.testing.allocator;
 
-    // Write 5 sequences
-    var seqs_arr: [5]Sequence = undefined;
-    var to_free: usize = 0;
-    defer for (0..to_free) |i| seqs_arr[i].deinit();
+    // Create a test Easel database.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
 
-    for (0..5) |i| {
-        var name_buf: [8]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "s{d}", .{i}) catch unreachable;
-        seqs_arr[i] = try Sequence.fromText(allocator, &alphabet_mod.dna, name, "ACGTACGT");
-        to_free = i + 1;
-    }
+    // 5-bit amino packet: A(0), C(1), D(2), E(3), F(4) + sentinel
+    const pkt: u32 = pack.EOD | pack.FIVEBIT |
+        (@as(u32, 0) << 25) |
+        (@as(u32, 1) << 20) |
+        (@as(u32, 2) << 15) |
+        (@as(u32, 3) << 10) |
+        (@as(u32, 4) << 5) |
+        (@as(u32, 31) << 0);
 
-    var buf = std.ArrayList(u8){};
-    defer buf.deinit(allocator);
-    try write(buf.writer(allocator).any(), &alphabet_mod.dna, &seqs_arr);
+    const packets = [_]u32{pkt};
+    const names = [_][]const u8{"easel_seq"};
+    const pkt_seqs = [_][]const u32{&packets};
+    const lens = [_]u64{5};
 
-    // Read with prefetch (heap-allocated PrefetchReader)
-    var fbs = std.io.fixedBufferStream(buf.items);
-    _ = try readHeader(fbs.reader().any());
+    try easel_dsqdata.writeTestEaselDb(tmp_dir.dir, "mydb", 0xAABBCCDD, 3, &names, &pkt_seqs, &lens);
 
-    const reader = try PrefetchReader.create(allocator, fbs.reader().any(), &alphabet_mod.dna, 2);
-    defer reader.destroy();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp_dir.dir.realpath(".", &path_buf);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/mydb", .{dir_path});
+    defer allocator.free(full_path);
 
-    var total_seqs: usize = 0;
-    while (reader.read()) |block| {
-        defer reader.recycle(block);
-        total_seqs += block.count;
-    }
+    var db = try DsqData.open(allocator, full_path);
+    defer db.deinit();
 
-    try std.testing.expectEqual(@as(usize, 5), total_seqs);
+    // Verify it detected easel format.
+    try std.testing.expect(db == .easel);
+
+    // Verify header.
+    const hdr = db.header();
+    try std.testing.expectEqual(@as(u64, 1), hdr.num_sequences);
+    try std.testing.expectEqual(alphabet_mod.AlphabetType.amino, hdr.alphabet_type);
+
+    // Read sequence.
+    var seq = (try db.next(allocator, &alphabet_mod.amino)).?;
+    defer seq.deinit();
+    try std.testing.expectEqualStrings("easel_seq", seq.name);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 2, 3, 4 }, seq.dsq);
+}
+
+test "DsqData.open: auto-detects easel format from .dsqi path" {
+    const allocator = std.testing.allocator;
+
+    // Create a test Easel database.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const pkt: u32 = pack.EOD | pack.FIVEBIT |
+        (@as(u32, 0) << 25) |
+        (@as(u32, 1) << 20) |
+        (@as(u32, 2) << 15) |
+        (@as(u32, 3) << 10) |
+        (@as(u32, 4) << 5) |
+        (@as(u32, 31) << 0);
+
+    const packets = [_]u32{pkt};
+    const names = [_][]const u8{"dsqi_seq"};
+    const pkt_seqs = [_][]const u32{&packets};
+    const lens = [_]u64{5};
+
+    try easel_dsqdata.writeTestEaselDb(tmp_dir.dir, "pathtest", 0x11223344, 3, &names, &pkt_seqs, &lens);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp_dir.dir.realpath(".", &path_buf);
+    // Pass the .dsqi path explicitly.
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/pathtest.dsqi", .{dir_path});
+    defer allocator.free(full_path);
+
+    var db = try DsqData.open(allocator, full_path);
+    defer db.deinit();
+
+    // Verify it detected easel format.
+    try std.testing.expect(db == .easel);
+
+    // Read sequence to verify it works end-to-end.
+    var seq = (try db.next(allocator, &alphabet_mod.amino)).?;
+    defer seq.deinit();
+    try std.testing.expectEqualStrings("dsqi_seq", seq.name);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 2, 3, 4 }, seq.dsq);
 }
