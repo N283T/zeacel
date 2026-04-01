@@ -300,8 +300,12 @@ pub const Matrix = struct {
         var term = try Matrix.initIdentity(self.allocator, n);
         defer term.deinit();
 
-        // Compute Taylor series: exp(A) = I + A + A^2/2! + ... + A^12/12!
-        for (1..13) |k| {
+        // Compute Taylor series: exp(A) = I + A + A^2/2! + ... with convergence check.
+        // Stop early when the Frobenius norm of the current term is negligible
+        // relative to the accumulated result, or after max_terms iterations.
+        const max_terms: usize = 30;
+        const tol: f64 = 1e-15;
+        for (1..max_terms + 1) |k| {
             var product = try Matrix.multiply(self.allocator, term, a_mat);
             term.deinit();
             term = try product.scale(1.0 / @as(f64, @floatFromInt(k)));
@@ -311,6 +315,11 @@ pub const Matrix = struct {
             for (0..n * n) |idx| {
                 result.data[idx] += term.data[idx];
             }
+
+            // Check convergence: ||term||_F < tol * ||result||_F
+            const term_norm = term.frobeniusNorm();
+            const result_norm = result.frobeniusNorm();
+            if (term_norm < tol * result_norm) break;
         }
 
         // Square s times: exp(t*M) = (exp(t*M/2^s))^(2^s)

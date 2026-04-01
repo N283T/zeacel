@@ -91,10 +91,7 @@ pub fn parseOne(allocator: Allocator, abc: *const Alphabet, data: []const u8, po
         try seq_buf.append(allocator, c);
     }
 
-    // A FASTA record with a header but no sequence data is invalid.
-    if (seq_buf.items.len == 0) return error.InvalidFormat;
-
-    // Digitize accumulated sequence text
+    // Digitize accumulated sequence text (empty sequences are valid in FASTA)
     const dsq = try abc.digitize(allocator, seq_buf.items);
     errdefer allocator.free(dsq);
 
@@ -240,12 +237,34 @@ test "parseAll: empty input returns empty slice" {
     try std.testing.expectEqual(@as(usize, 0), seqs.len);
 }
 
-test "parseAll: empty sequence returns error" {
+test "parseAll: empty sequence accepted" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(
-        error.InvalidFormat,
-        parseAll(allocator, &alphabet_mod.dna, ">seq1\n>seq2\nACGT\n"),
-    );
+    const seqs = try parseAll(allocator, &alphabet_mod.dna, ">seq1\n>seq2\nACGT\n");
+    defer {
+        for (seqs) |*s| @constCast(s).deinit();
+        allocator.free(seqs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), seqs.len);
+    try std.testing.expectEqualStrings("seq1", seqs[0].name);
+    try std.testing.expectEqual(@as(usize, 0), seqs[0].dsq.len);
+    try std.testing.expectEqualStrings("seq2", seqs[1].name);
+    try std.testing.expectEqual(@as(usize, 4), seqs[1].dsq.len);
+}
+
+test "parseAll: empty sequence at end" {
+    const allocator = std.testing.allocator;
+    const seqs = try parseAll(allocator, &alphabet_mod.dna, ">seq1\nACGT\n>seq2\n");
+    defer {
+        for (seqs) |*s| @constCast(s).deinit();
+        allocator.free(seqs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), seqs.len);
+    try std.testing.expectEqualStrings("seq1", seqs[0].name);
+    try std.testing.expectEqual(@as(usize, 4), seqs[0].dsq.len);
+    try std.testing.expectEqualStrings("seq2", seqs[1].name);
+    try std.testing.expectEqual(@as(usize, 0), seqs[1].dsq.len);
 }
 
 test "parseAll: invalid format (no '>') returns error" {

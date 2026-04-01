@@ -24,8 +24,12 @@ pub fn surv(x: f64, mu: f64, lambda: f64) f64 {
 }
 
 /// Log PDF: log(lambda) - lambda*(x - mu) for x >= mu, else -inf.
+/// Guards against lambda = infinity to prevent NaN.
 pub fn logPdf(x: f64, mu: f64, lambda: f64) f64 {
     if (x < mu) return -math.inf(f64);
+    if (math.isPositiveInf(lambda)) {
+        return if (x == mu) math.inf(f64) else -math.inf(f64);
+    }
     return @log(lambda) - lambda * (x - mu);
 }
 
@@ -52,6 +56,12 @@ pub fn logSurv(x: f64, mu: f64, lambda: f64) f64 {
 /// Inverse CDF: mu - (1/lambda) * log(1 - p)
 pub fn invcdf(p: f64, mu: f64, lambda: f64) f64 {
     return mu - (1.0 / lambda) * @log(1.0 - p);
+}
+
+/// Inverse survival: mu - (1/lambda) * log(p).
+/// Reference: Easel esl_exp_invsurv().
+pub fn invsurv(p: f64, mu: f64, lambda: f64) f64 {
+    return mu - (1.0 / lambda) * @log(p);
 }
 
 /// Result of fitting an exponential distribution.

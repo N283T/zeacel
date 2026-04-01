@@ -113,19 +113,22 @@ pub fn gTest(ca: u32, na: u32, cb: u32, nb: u32) struct { g: f64, p: f64 } {
     const d: f64 = @floatFromInt(nb - cb);
     const n: f64 = @as(f64, @floatFromInt(na)) + @as(f64, @floatFromInt(nb));
 
-    var g: f64 = 0;
-    if (a > 0) g += a * @log(a);
-    if (b > 0) g += b * @log(b);
-    if (c > 0) g += c * @log(c);
-    if (d > 0) g += d * @log(d);
-    if (n > 0) g += n * @log(n);
-    if (a + b > 0) g -= (a + b) * @log(a + b);
-    if (c + d > 0) g -= (c + d) * @log(c + d);
-    if (a + c > 0) g -= (a + c) * @log(a + c);
-    if (b + d > 0) g -= (b + d) * @log(b + d);
+    var llr: f64 = 0;
+    if (a > 0) llr += a * @log(a);
+    if (b > 0) llr += b * @log(b);
+    if (c > 0) llr += c * @log(c);
+    if (d > 0) llr += d * @log(d);
+    if (n > 0) llr += n * @log(n);
+    if (a + b > 0) llr -= (a + b) * @log(a + b);
+    if (c + d > 0) llr -= (c + d) * @log(c + d);
+    if (a + c > 0) llr -= (a + c) * @log(a + c);
+    if (b + d > 0) llr -= (b + d) * @log(b + d);
 
-    // P-value from chi-squared with 1 df
-    const p = 1.0 - gamma_mod.incompleteGamma(0.5, g);
+    // G = 2 * LLR (standard G-test statistic)
+    const g = 2.0 * llr;
+
+    // P-value from chi-squared with 1 df: P(chi^2 > G) = Q(0.5, G/2) = 1 - P(0.5, G/2)
+    const p = 1.0 - gamma_mod.incompleteGamma(0.5, g / 2.0);
 
     return .{ .g = g, .p = p };
 }

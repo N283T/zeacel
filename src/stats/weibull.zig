@@ -25,10 +25,15 @@ pub fn pdf(x: f64, mu: f64, lambda: f64, tau: f64) f64 {
 }
 
 /// CDF: 1 - exp(-(lambda*(x-mu))^tau)  for x >= mu, else 0.
+/// Uses small-value approximation when u^tau < 1e-9 to avoid precision loss
+/// near mu. Reference: Easel esl_wei_cdf().
 pub fn cdf(x: f64, mu: f64, lambda: f64, tau: f64) f64 {
-    if (x < mu) return 0.0;
+    if (x <= mu) return 0.0;
     const u = lambda * (x - mu);
-    return 1.0 - @exp(-math.pow(f64, u, tau));
+    const ut = math.pow(f64, u, tau);
+    // For very small ut, 1 - exp(-ut) ≈ ut (first-order Taylor).
+    if (ut < 1e-9) return ut;
+    return 1.0 - @exp(-ut);
 }
 
 /// Survival function: exp(-(lambda*(x-mu))^tau)  for x >= mu, else 1.

@@ -153,6 +153,86 @@ pub fn reverse(allocator: Allocator, wuss: []const u8) ![]u8 {
     return buf;
 }
 
+/// Convert a base-pair table to rich WUSS notation with pseudoknot detection.
+/// The main (non-crossing) structure uses '(' and ')'. Pairs that cross the
+/// main structure get '<' and '>', further crossings get '[' ']', then '{' '}'.
+/// Up to 4 bracket levels are supported; additional levels return error.TooManyPseudoknots.
+pub fn pairsToWuss(allocator: Allocator, pairs: []const i32) ![]u8 {
+    const len = pairs.len;
+    const buf = try allocator.alloc(u8, len);
+    errdefer allocator.free(buf);
+    @memset(buf, '.');
+
+    if (len == 0) return buf;
+
+    const open_chars = [_]u8{ '(', '<', '[', '{' };
+    const close_chars = [_]u8{ ')', '>', ']', '}' };
+    const max_levels = open_chars.len;
+
+    // Collect all base pairs (i < j) sorted by opening position.
+    var pair_count: usize = 0;
+    for (pairs) |p| {
+        if (p >= 0) pair_count += 1;
+    }
+    pair_count /= 2; // Each pair counted twice.
+
+    const pair_list = try allocator.alloc([2]usize, pair_count);
+    defer allocator.free(pair_list);
+    var idx: usize = 0;
+    for (pairs, 0..) |p, i| {
+        if (p >= 0 and @as(usize, @intCast(p)) > i) {
+            pair_list[idx] = .{ i, @intCast(p) };
+            idx += 1;
+        }
+    }
+
+    // Assign bracket levels. level[k] is the bracket type for pair k.
+    const levels = try allocator.alloc(u8, pair_count);
+    defer allocator.free(levels);
+    @memset(levels, 0xff); // Unassigned sentinel.
+
+    // Greedy assignment: iterate through bracket levels and assign each pair
+    // to the lowest level where it does not cross any previously-assigned pair
+    // at the same level.
+    for (0..max_levels) |level| {
+        for (0..pair_count) |k| {
+            if (levels[k] != 0xff) continue; // Already assigned.
+
+            // Check if pair k crosses any pair already assigned to this level.
+            var crosses = false;
+            for (0..pair_count) |m| {
+                if (levels[m] != level) continue;
+                // Two pairs (a,b) and (c,d) cross iff a < c < b < d or c < a < d < b.
+                const a = pair_list[k][0];
+                const b = pair_list[k][1];
+                const c = pair_list[m][0];
+                const d = pair_list[m][1];
+                if ((a < c and c < b and b < d) or (c < a and a < d and d < b)) {
+                    crosses = true;
+                    break;
+                }
+            }
+            if (!crosses) {
+                levels[k] = @intCast(level);
+            }
+        }
+    }
+
+    // Check that all pairs were assigned a level.
+    for (levels) |l| {
+        if (l == 0xff) return error.TooManyPseudoknots;
+    }
+
+    // Write the WUSS string.
+    for (0..pair_count) |k| {
+        const level = levels[k];
+        buf[pair_list[k][0]] = open_chars[level];
+        buf[pair_list[k][1]] = close_chars[level];
+    }
+
+    return buf;
+}
+
 // --- Tests ---
 
 test "parseToPairs: ((...)) gives expected pair table" {
@@ -243,4 +323,51 @@ test "pairsToSimple: all unpaired" {
     const simple = try pairsToSimple(allocator, &raw);
     defer allocator.free(simple);
     try std.testing.expectEqualStrings("...", simple);
+}
+
+test "pairsToWuss: simple nested structure uses parens" {
+    const allocator = std.testing.allocator;
+    const pairs = try parseToPairs(allocator, "((....))");
+    defer allocator.free(pairs);
+    const wuss = try pairsToWuss(allocator, pairs);
+    defer allocator.free(wuss);
+    try std.testing.expectEqualStrings("((....))", wuss);
+}
+
+test "pairsToWuss: all unpaired" {
+    const allocator = std.testing.allocator;
+    const wuss = try pairsToWuss(allocator, &[_]i32{ -1, -1, -1, -1 });
+    defer allocator.free(wuss);
+    try std.testing.expectEqualStrings("....", wuss);
+}
+
+test "pairsToWuss: empty input" {
+    const allocator = std.testing.allocator;
+    const wuss = try pairsToWuss(allocator, &[_]i32{});
+    defer allocator.free(wuss);
+    try std.testing.expectEqualStrings("", wuss);
+}
+
+test "pairsToWuss: pseudoknot gets angle brackets" {
+    // (0,5) and (2,7) cross because 0 < 2 < 5 < 7.
+    //   pos:   0  1  2  3  4  5  6  7
+    //   pairs: 5 -1  7 -1 -1  0 -1  2
+    const allocator = std.testing.allocator;
+    const pairs = [_]i32{ 5, -1, 7, -1, -1, 0, -1, 2 };
+    const wuss = try pairsToWuss(allocator, &pairs);
+    defer allocator.free(wuss);
+    // (0,5) -> '(' ')' at level 0, (2,7) crosses it -> '<' '>' at level 1.
+    try std.testing.expectEqualStrings("(.<..).>", wuss);
+}
+
+test "pairsToWuss: round-trip non-crossing pairs all get parens" {
+    // Parse "((..<<..>>..))". The pairs (0,13) (1,12) (4,9) (5,8) are all nested,
+    // none cross, so pairsToWuss should assign all to level 0 (parens).
+    const allocator = std.testing.allocator;
+    const input = "((..<<..>>..))";
+    const pairs = try parseToPairs(allocator, input);
+    defer allocator.free(pairs);
+    const wuss = try pairsToWuss(allocator, pairs);
+    defer allocator.free(wuss);
+    try std.testing.expectEqualStrings("((..((..))..))", wuss);
 }

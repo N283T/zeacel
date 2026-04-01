@@ -72,11 +72,32 @@ pub fn parse(allocator: Allocator, abc: *const Alphabet, data: []const u8) !Msa 
         text_seqs[i] = seq_bufs.items[i].items;
     }
 
-    const result = try Msa.fromText(allocator, abc, name_list.items, text_seqs);
+    // Generate RF annotation before fromText consumes text_seqs content.
+    // A column is consensus ('x') if any sequence has an uppercase letter; otherwise insert ('.').
+    const alen = if (n > 0) text_seqs[0].len else 0;
+    const rf = try allocator.alloc(u8, alen);
+    errdefer allocator.free(rf);
+    for (0..alen) |col| {
+        var has_upper = false;
+        for (text_seqs) |seq_text| {
+            if (col < seq_text.len) {
+                const ch = seq_text[col];
+                if (ch >= 'A' and ch <= 'Z') {
+                    has_upper = true;
+                    break;
+                }
+            }
+        }
+        rf[col] = if (has_upper) 'x' else '.';
+    }
+
+    var result = try Msa.fromText(allocator, abc, name_list.items, text_seqs);
 
     // fromText duped names, free our copies
     for (name_list.items) |nm| allocator.free(nm);
     name_list.items.len = 0; // prevent double-free in defer
+
+    result.reference = rf;
 
     return result;
 }
@@ -121,6 +142,47 @@ test "parse: simple PSI-BLAST" {
     try std.testing.expectEqual(@as(usize, 2), msa.nseq());
     try std.testing.expectEqual(@as(usize, 10), msa.alen);
     try std.testing.expectEqualStrings("query", msa.names[0]);
+}
+
+test "parse: RF annotation generated from case" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("../alphabet.zig").amino;
+
+    // Uppercase columns are consensus ('x'), lowercase columns are insert ('.')
+    const data =
+        \\query  ACdef
+        \\hit1   ACdEG
+    ;
+
+    var msa = try parse(allocator, abc, data);
+    defer msa.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), msa.nseq());
+    try std.testing.expectEqual(@as(usize, 5), msa.alen);
+
+    // Column 0: A(upper) -> x
+    // Column 1: C(upper) -> x
+    // Column 2: d(lower), d(lower) -> .
+    // Column 3: e(lower), E(upper) -> x
+    // Column 4: f(lower), G(upper) -> x
+    const rf = msa.reference orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("xx.xx", rf);
+}
+
+test "parse: RF annotation all uppercase" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("../alphabet.zig").amino;
+
+    const data =
+        \\s1  ACDEF
+        \\s2  GHIKL
+    ;
+
+    var msa = try parse(allocator, abc, data);
+    defer msa.deinit();
+
+    const rf = msa.reference orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("xxxxx", rf);
 }
 
 test "write: round trip" {
