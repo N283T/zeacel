@@ -9,6 +9,9 @@ const Alphabet = @import("alphabet.zig").Alphabet;
 const alphabet_mod = @import("alphabet.zig");
 const Sequence = @import("sequence.zig").Sequence;
 
+pub const easel = @import("dsqdata/easel.zig");
+pub const pack = @import("dsqdata/pack.zig");
+
 pub const MAGIC = "ZSQD".*;
 pub const VERSION: u32 = 1;
 
@@ -230,6 +233,13 @@ pub const PrefetchReader = struct {
         }
     }
 };
+
+// --- Sub-module test references ---
+
+test {
+    _ = easel;
+    _ = pack;
+}
 
 // --- Tests ---
 
