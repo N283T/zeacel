@@ -4,6 +4,10 @@
 /// normalize, entropy, and log-sum-exp.
 pub const vector_ops = @import("simd/vector_ops.zig");
 
+/// Vectorized f32 math functions (logf, expf) using Cephes/Easel polynomial
+/// approximations that operate directly on @Vector(N, f32) SIMD types.
+pub const math = @import("simd/math.zig");
+
 pub const VectorOps = vector_ops.VectorOps;
 pub const VecF64 = vector_ops.VecF64;
 pub const VecF32 = vector_ops.VecF32;
