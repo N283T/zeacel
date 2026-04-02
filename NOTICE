@@ -40,29 +40,24 @@ The following elements are derived from Easel:
 Algorithms and constants from other sources (via Easel)
 ================================================================================
 
-  Mersenne Twister RNG
-    Takuji Nishimura and Makoto Matsumoto
-    Copyright (C) 1997-2002
-    BSD License
-
   SIMD vectorized logf/expf (Cephes polynomial approximations)
-    Stephen Moshier (original C)
+    Stephen Moshier (Cephes math library, original C)
     Julien Pommier (SSE adaptation)
     Public domain / zlib license
-
-  erfc() implementation
-    Sun Microsystems, Inc.
-    Copyright (C) 1993
-    Freely redistributable
+    Used in: src/simd/math.zig
 
   Jenkins one-at-a-time hash
     Bob Jenkins
     Public domain
-
-  Gamma deviate (Marsaglia-Tsang method)
-    George Marsaglia and Wai Wan Tsang
-    "A Simple Method for Generating Gamma Variables" (2000)
+    Used in: src/sequence.zig, src/msa.zig (crcChecksum)
 
   Altschul-Erickson dinucleotide shuffle
     Stephen F. Altschul and Bruce W. Erickson
     "Significance of Nucleotide Sequence Alignments" (1985)
+    Used in: src/util/random_seq.zig
+
+  Gamma deviate (Knuth / Ahrens-Dieter acceptance-rejection)
+    Donald E. Knuth, "The Art of Computer Programming" Vol. 2
+    J.H. Ahrens and U. Dieter, "Generating Gamma Variates by a
+    Modified Rejection Technique" (1982)
+    Used in: src/util/random.zig
