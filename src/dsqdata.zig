@@ -150,8 +150,16 @@ pub const DsqData = union(enum) {
             return DsqData{ .easel = try easel_dsqdata.EaselDsqData.open(allocator, basename) };
         }
 
+        // Neither magic matched. The file might be an Easel stub (text file
+        // starting with "Easel dsqdata ..."). Check whether path ++ ".dsqi" exists
+        // and if so treat path as the Easel basename.
         file.close();
-        return error.InvalidFormat;
+        {
+            const dsqi_path = try std.fmt.allocPrint(allocator, "{s}.dsqi", .{path});
+            defer allocator.free(dsqi_path);
+            std.fs.cwd().access(dsqi_path, .{}) catch return error.InvalidFormat;
+            return DsqData{ .easel = try easel_dsqdata.EaselDsqData.open(allocator, path) };
+        }
     }
 
     /// Read the next sequence from the database.
