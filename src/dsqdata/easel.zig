@@ -15,13 +15,20 @@ const pack = @import("pack.zig");
 const MAGIC: u32 = 0xc4d3d1b1;
 const MAGIC_SWAPPED: u32 = 0xb1d1d3c4;
 
+// .dsqi header: 7 × u32 (28 bytes) + 3 × u64 (24 bytes) = 52 bytes. No padding.
+const IDX_HEADER_SIZE: u64 = 52;
+// .dsqm / .dsqs header: magic(u32) + uniquetag(u32) = 8 bytes.
+const DATA_HEADER_SIZE: u64 = 8;
+// Each index record: metadata_end(i64) + psq_end(i64) = 16 bytes.
+const IDX_RECORD_SIZE: u64 = 16;
+
 pub const EaselDsqData = struct {
     allocator: Allocator,
     idx_file: std.fs.File, // .dsqi
     meta_file: std.fs.File, // .dsqm
     seq_file: std.fs.File, // .dsqs
 
-    // From .dsqi header (56 bytes)
+    // From .dsqi header (52 bytes)
     uniquetag: u32,
     alphabet_type: alphabet_mod.AlphabetType,
     max_name_len: u32,
@@ -35,6 +42,9 @@ pub const EaselDsqData = struct {
     current_seq: u64,
 
     pub fn open(allocator: Allocator, basename: []const u8) !EaselDsqData {
+        // Open stub file and read uniquetag.
+        const uniquetag = try readStubTag(allocator, basename);
+
         // Open .dsqi
         const dsqi_path = try std.fmt.allocPrint(allocator, "{s}.dsqi", .{basename});
         defer allocator.free(dsqi_path);
@@ -53,27 +63,29 @@ pub const EaselDsqData = struct {
         const seq_file = try std.fs.cwd().openFile(dsqs_path, .{});
         errdefer seq_file.close();
 
-        // Read .dsqi header (56 bytes) using positional read
-        var idx_hdr: [56]u8 = undefined;
+        // Read .dsqi header (52 bytes): 7×u32 + 3×u64, no padding.
+        var idx_hdr: [IDX_HEADER_SIZE]u8 = undefined;
         _ = idx_file.preadAll(&idx_hdr, 0) catch return error.InvalidFormat;
 
         const magic = std.mem.readInt(u32, idx_hdr[0..4], .little);
         if (magic == MAGIC_SWAPPED) return error.ByteswapNotSupported;
         if (magic != MAGIC) return error.InvalidFormat;
 
-        const uniquetag = std.mem.readInt(u32, idx_hdr[4..8], .little);
+        const idx_tag = std.mem.readInt(u32, idx_hdr[4..8], .little);
+        if (idx_tag != uniquetag) return error.TagMismatch;
+
         const alphatype_raw = std.mem.readInt(u32, idx_hdr[8..12], .little);
         // idx_hdr[12..16] = flags (ignored)
         const max_name_len = std.mem.readInt(u32, idx_hdr[16..20], .little);
         const max_acc_len = std.mem.readInt(u32, idx_hdr[20..24], .little);
         const max_desc_len = std.mem.readInt(u32, idx_hdr[24..28], .little);
-        // idx_hdr[28..32] = padding (ignored)
-        const max_seq_len = std.mem.readInt(u64, idx_hdr[32..40], .little);
-        const nseq = std.mem.readInt(u64, idx_hdr[40..48], .little);
-        const nres = std.mem.readInt(u64, idx_hdr[48..56], .little);
+        // No padding — u64s start at offset 28.
+        const max_seq_len = std.mem.readInt(u64, idx_hdr[28..36], .little);
+        const nseq = std.mem.readInt(u64, idx_hdr[36..44], .little);
+        const nres = std.mem.readInt(u64, idx_hdr[44..52], .little);
 
         // Read .dsqm header (8 bytes: magic + uniquetag)
-        var meta_hdr: [8]u8 = undefined;
+        var meta_hdr: [DATA_HEADER_SIZE]u8 = undefined;
         _ = meta_file.preadAll(&meta_hdr, 0) catch return error.InvalidFormat;
 
         const meta_magic = std.mem.readInt(u32, meta_hdr[0..4], .little);
@@ -83,7 +95,7 @@ pub const EaselDsqData = struct {
         if (meta_tag != uniquetag) return error.TagMismatch;
 
         // Read .dsqs header (8 bytes: magic + uniquetag)
-        var seq_hdr: [8]u8 = undefined;
+        var seq_hdr: [DATA_HEADER_SIZE]u8 = undefined;
         _ = seq_file.preadAll(&seq_hdr, 0) catch return error.InvalidFormat;
 
         const seq_magic = std.mem.readInt(u32, seq_hdr[0..4], .little);
@@ -94,8 +106,8 @@ pub const EaselDsqData = struct {
 
         // Seek past the headers for sequential reading.
         // preadAll does not advance file position, so we seek manually.
-        meta_file.seekTo(8) catch return error.InvalidFormat;
-        seq_file.seekTo(8) catch return error.InvalidFormat;
+        meta_file.seekTo(DATA_HEADER_SIZE) catch return error.InvalidFormat;
+        seq_file.seekTo(DATA_HEADER_SIZE) catch return error.InvalidFormat;
 
         // Map Easel alphabet type: 1=dna, 2=rna, 3=amino
         const alphabet_type: alphabet_mod.AlphabetType = switch (alphatype_raw) {
@@ -197,34 +209,56 @@ pub const EaselDsqData = struct {
     pub fn readSequence(self: *EaselDsqData, allocator: Allocator, abc: *const Alphabet, seq_idx: u64) !?Sequence {
         if (seq_idx >= self.num_sequences) return null;
 
-        // Read the index record for this sequence and (if needed) the previous one.
-        // Index records start at offset 56 (header size), each is 16 bytes.
-        const idx_offset = 56 + seq_idx * 16;
+        // Index records start immediately after the 52-byte header.
+        // Each record is 16 bytes: metadata_end(i64) + psq_end(i64).
+        //
+        // metadata_end: 0-based cumulative byte end index into the metadata data
+        //   section (the region of .dsqm after the 8-byte file header).
+        // psq_end: 0-based cumulative packet (u32) end index into the sequence
+        //   data section (the region of .dsqs after the 8-byte file header).
+        //
+        // For seq i:
+        //   meta data occupies bytes [meta_start_data .. meta_end_data_inclusive]
+        //     where meta_start_data = (i==0) ? 0 : idx[i-1].metadata_end + 1
+        //           meta_end_data   = idx[i].metadata_end        (inclusive end)
+        //   psq data occupies packets [psq_start_pkt .. psq_end_pkt_inclusive]
+        //     where psq_start_pkt = (i==0) ? 0 : idx[i-1].psq_end + 1
+        //           psq_end_pkt   = idx[i].psq_end                (inclusive end)
+        //
+        // File offsets add DATA_HEADER_SIZE (8) to the data-section offsets.
 
-        var idx_buf: [16]u8 = undefined;
-        _ = try self.idx_file.preadAll(&idx_buf, idx_offset);
+        const rec_offset = IDX_HEADER_SIZE + seq_idx * IDX_RECORD_SIZE;
 
-        const meta_end: u64 = @bitCast(std.mem.readInt(i64, idx_buf[0..8], .little));
-        const psq_end: u64 = @bitCast(std.mem.readInt(i64, idx_buf[8..16], .little));
+        var idx_buf: [IDX_RECORD_SIZE]u8 = undefined;
+        _ = try self.idx_file.preadAll(&idx_buf, rec_offset);
 
-        // Compute start offsets: first seq starts at 8 (after file headers),
-        // subsequent seqs start at the previous record's end offset.
-        var meta_start: u64 = 8;
-        var psq_start: u64 = 8;
+        const meta_end_data = std.mem.readInt(i64, idx_buf[0..8], .little);
+        const psq_end_pkt = std.mem.readInt(i64, idx_buf[8..16], .little);
+
+        var meta_start_data: i64 = 0;
+        var psq_start_pkt: i64 = 0;
 
         if (seq_idx > 0) {
-            const prev_idx_offset = 56 + (seq_idx - 1) * 16;
-            var prev_buf: [16]u8 = undefined;
-            _ = try self.idx_file.preadAll(&prev_buf, prev_idx_offset);
-            meta_start = @bitCast(std.mem.readInt(i64, prev_buf[0..8], .little));
-            psq_start = @bitCast(std.mem.readInt(i64, prev_buf[8..16], .little));
+            const prev_rec_offset = IDX_HEADER_SIZE + (seq_idx - 1) * IDX_RECORD_SIZE;
+            var prev_buf: [IDX_RECORD_SIZE]u8 = undefined;
+            _ = try self.idx_file.preadAll(&prev_buf, prev_rec_offset);
+            meta_start_data = std.mem.readInt(i64, prev_buf[0..8], .little) + 1;
+            psq_start_pkt = std.mem.readInt(i64, prev_buf[8..16], .little) + 1;
         }
 
+        // Convert data-section offsets to absolute file offsets.
+        const meta_file_start: u64 = @intCast(meta_start_data + @as(i64, @intCast(DATA_HEADER_SIZE)));
+        const meta_file_end: u64 = @intCast(meta_end_data + @as(i64, @intCast(DATA_HEADER_SIZE)) + 1);
+        const meta_len = meta_file_end - meta_file_start;
+
+        const psq_file_start: u64 = @intCast(psq_start_pkt * 4 + @as(i64, @intCast(DATA_HEADER_SIZE)));
+        const psq_num_pkts: u64 = @intCast(psq_end_pkt - psq_start_pkt + 1);
+        const psq_byte_len: u64 = psq_num_pkts * 4;
+
         // Read metadata via positional read
-        const meta_len = meta_end - meta_start;
         const meta_data = try allocator.alloc(u8, meta_len);
         defer allocator.free(meta_data);
-        _ = try self.meta_file.preadAll(meta_data, meta_start);
+        _ = try self.meta_file.preadAll(meta_data, meta_file_start);
 
         // Parse metadata: name\0, accession\0, description\0, taxonomy_id(i32)
         var pos: usize = 0;
@@ -247,13 +281,12 @@ pub const EaselDsqData = struct {
         const taxonomy_id = std.mem.readInt(i32, meta_data[pos..][0..4], .little);
 
         // Read packet data via positional read
-        const psq_len = psq_end - psq_start;
-        const psq_data = try allocator.alloc(u8, psq_len);
+        const psq_data = try allocator.alloc(u8, psq_byte_len);
         defer allocator.free(psq_data);
-        _ = try self.seq_file.preadAll(psq_data, psq_start);
+        _ = try self.seq_file.preadAll(psq_data, psq_file_start);
 
         // Parse packets (each is 4 bytes, little-endian)
-        const num_packets = psq_len / 4;
+        const num_packets = psq_byte_len / 4;
         var packets = try allocator.alloc(u32, num_packets);
         defer allocator.free(packets);
         for (0..num_packets) |i| {
@@ -334,6 +367,39 @@ pub const EaselDsqData = struct {
     }
 };
 
+/// Read the uniquetag from the Easel stub file.
+/// The first line has the format: "Easel dsqdata v1 x<uniquetag>\n"
+fn readStubTag(allocator: Allocator, basename: []const u8) !u32 {
+    const stub_path = try std.fmt.allocPrint(allocator, "{s}", .{basename});
+    defer allocator.free(stub_path);
+
+    const stub_file = std.fs.cwd().openFile(stub_path, .{}) catch return error.InvalidFormat;
+    defer stub_file.close();
+
+    var buf: [256]u8 = undefined;
+    const reader = stub_file.deprecatedReader();
+    const line = (reader.readUntilDelimiterOrEof(&buf, '\n') catch return error.InvalidFormat) orelse return error.InvalidFormat;
+
+    // Expected: "Easel dsqdata v1 x<uniquetag>"
+    // Split on whitespace: tokens = ["Easel", "dsqdata", "v1", "x<uniquetag>"]
+    var it = std.mem.tokenizeAny(u8, line, " \t\r");
+
+    const tok0 = it.next() orelse return error.InvalidFormat;
+    if (!std.mem.eql(u8, tok0, "Easel")) return error.InvalidFormat;
+
+    const tok1 = it.next() orelse return error.InvalidFormat;
+    if (!std.mem.eql(u8, tok1, "dsqdata")) return error.InvalidFormat;
+
+    const tok2 = it.next() orelse return error.InvalidFormat;
+    if (tok2.len < 2 or tok2[0] != 'v') return error.InvalidFormat;
+
+    const tok3 = it.next() orelse return error.InvalidFormat;
+    if (tok3.len < 2 or tok3[0] != 'x') return error.InvalidFormat;
+
+    const tag = std.fmt.parseInt(u32, tok3[1..], 10) catch return error.InvalidFormat;
+    return tag;
+}
+
 fn readNullTerminated(allocator: Allocator, reader: anytype) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -384,7 +450,15 @@ fn countResiduesFromPackets(packets: []const u32, is_amino: bool) u64 {
 // --- Test helper ---
 
 /// Write a minimal Easel database to a directory for testing.
-/// Creates basename.dsqi, basename.dsqm, basename.dsqs, and basename stub.
+/// Creates basename (stub), basename.dsqi, basename.dsqm, basename.dsqs.
+///
+/// Index record semantics (matching Easel's esl_dsqdata.c):
+///   metadata_end: 0-based cumulative end byte index into the metadata data
+///     section (the bytes of .dsqm after the 8-byte file header).
+///     Computed as: sum of all metadata bytes written so far, minus 1.
+///   psq_end: 0-based cumulative end packet index into the sequence data
+///     section (the u32 packets of .dsqs after the 8-byte file header).
+///     Computed as: total packets written so far, minus 1.
 pub fn writeTestEaselDb(
     dir: std.fs.Dir,
     basename: []const u8,
@@ -398,7 +472,7 @@ pub fn writeTestEaselDb(
 
     const nseq = names.len;
 
-    // Compute total residues and max lengths
+    // Compute summary statistics for the header.
     var total_res: u64 = 0;
     var max_name_len: u32 = 0;
     for (0..nseq) |i| {
@@ -425,14 +499,26 @@ pub fn writeTestEaselDb(
 
     var path_buf: [256]u8 = undefined;
 
+    // --- Write stub file ---
+    // Format: "Easel dsqdata v1 x<uniquetag>\n\n..."
+    {
+        const file = try dir.createFile(basename, .{});
+        defer file.close();
+        const w = file.deprecatedWriter();
+        try w.print("Easel dsqdata v1 x{d}\n", .{uniquetag});
+        try w.print("\n", .{});
+    }
+
     // --- Write .dsqi ---
+    // Header: 7 × u32 + 3 × u64 = 52 bytes (no padding).
+    // Followed by nseq index records: metadata_end(i64) + psq_end(i64).
     {
         const path = try std.fmt.bufPrint(&path_buf, "{s}.dsqi", .{basename});
         const file = try dir.createFile(path, .{});
         defer file.close();
         const w = file.deprecatedWriter();
 
-        // 56-byte header
+        // 52-byte header
         try w.writeInt(u32, MAGIC, .little);
         try w.writeInt(u32, uniquetag, .little);
         try w.writeInt(u32, alphatype, .little);
@@ -440,24 +526,29 @@ pub fn writeTestEaselDb(
         try w.writeInt(u32, max_name_len, .little);
         try w.writeInt(u32, 0, .little); // max_acclen
         try w.writeInt(u32, 0, .little); // max_desclen
-        try w.writeInt(u32, 0, .little); // padding
-        try w.writeInt(u64, 0, .little); // max_seqlen
+        // No padding — u64s follow immediately.
+        try w.writeInt(u64, 0, .little); // max_seqlen (not critical for tests)
         try w.writeInt(u64, @intCast(nseq), .little);
         try w.writeInt(u64, total_res, .little);
 
-        // Index records: metadata_end(i64) + psq_end(i64)
-        var meta_offset: i64 = 8;
-        var psq_offset: i64 = 8;
+        // Index records.
+        // psq_end  = cumulative packet count - 1 (0-based end index).
+        // meta_end = cumulative metadata byte count - 1 (0-based end index).
+        // Both count from the start of their data section (after the 8-byte header).
+        // metadata per sequence: name\0 + \0(acc) + \0(desc) + 4(tax_id) bytes.
+        var meta_cumulative: i64 = 0; // bytes written to metadata data section so far
+        var psq_cumulative: i64 = 0; // packets written to seq data section so far
 
         for (0..nseq) |i| {
             const meta_size: i64 = @intCast(names[i].len + 1 + 1 + 1 + 4);
-            meta_offset += meta_size;
+            meta_cumulative += meta_size;
 
-            const psq_size: i64 = @intCast(packet_seqs[i].len * 4);
-            psq_offset += psq_size;
+            const psq_count: i64 = @intCast(packet_seqs[i].len);
+            psq_cumulative += psq_count;
 
-            try w.writeInt(i64, meta_offset, .little);
-            try w.writeInt(i64, psq_offset, .little);
+            // Easel writes metadata_end first, then psq_end.
+            try w.writeInt(i64, meta_cumulative - 1, .little);
+            try w.writeInt(i64, psq_cumulative - 1, .little);
         }
     }
 
@@ -495,12 +586,6 @@ pub fn writeTestEaselDb(
                 try w.writeInt(u32, pkt, .little);
             }
         }
-    }
-
-    // --- Write stub file ---
-    {
-        const file = try dir.createFile(basename, .{});
-        defer file.close();
     }
 }
 
