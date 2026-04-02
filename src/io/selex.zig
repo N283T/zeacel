@@ -4,6 +4,22 @@
 // Spaces in sequence data are treated as gaps (mapped to '-').
 // Annotation lines: #=RF, #=CS, #=SS, #=SA can appear in blocks.
 // Blocks are separated by blank lines.
+//
+// Per-sequence annotation semantics (matching Easel esl_msafile_selex.c):
+//   #=SS and #=SA follow the sequence they annotate (the most recently seen
+//   sequence line). They are stored as per-sequence annotations in msa.ss /
+//   msa.sa, indexed by sequence index.
+//
+//   #=RF is per-alignment (consensus), stored in msa.reference.
+//   #=CS is per-alignment (consensus secondary structure), stored in msa.consensus_ss.
+//   #=SA with no preceding sequence is an error in strict mode; here it is
+//   silently ignored to be lenient with malformed files.
+//
+// Note on name-length parsing: sequence data is extracted by trimming the
+// name token and then treating the remainder as the sequence field. This
+// works correctly when names contain no embedded spaces. Files with
+// inconsistent name-column widths across blocks may be misparsed if names
+// have trailing spaces; such files are non-standard.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -28,15 +44,30 @@ pub fn parse(allocator: Allocator, abc: *const Alphabet, data: []const u8) !Msa 
     var name_to_idx = std.StringHashMap(usize).init(allocator);
     defer name_to_idx.deinit();
 
-    // Buffers for annotation lines (accumulated across blocks)
+    // Buffers for per-alignment annotation lines (accumulated across blocks)
     var rf_buf: std.ArrayList(u8) = .empty;
     defer rf_buf.deinit(allocator);
     var cs_buf: std.ArrayList(u8) = .empty;
     defer cs_buf.deinit(allocator);
-    var ss_buf: std.ArrayList(u8) = .empty;
-    defer ss_buf.deinit(allocator);
-    var sa_buf: std.ArrayList(u8) = .empty;
-    defer sa_buf.deinit(allocator);
+
+    // Per-sequence SS and SA buffers, indexed by sequence index.
+    // Allocated lazily when the first #=SS or #=SA line is encountered.
+    var ss_bufs: ?std.ArrayList(std.ArrayList(u8)) = null;
+    defer if (ss_bufs) |*b| {
+        for (b.items) |*s| s.deinit(allocator);
+        b.deinit(allocator);
+    };
+    var sa_bufs: ?std.ArrayList(std.ArrayList(u8)) = null;
+    defer if (sa_bufs) |*b| {
+        for (b.items) |*s| s.deinit(allocator);
+        b.deinit(allocator);
+    };
+
+    // Sentinel used to append a new empty per-sequence buffer slot.
+    const empty_buf: std.ArrayList(u8) = .empty;
+
+    // Index of the most recently parsed sequence line (null = no sequence seen yet).
+    var last_seq_idx: ?usize = null;
 
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |line| {
@@ -56,9 +87,39 @@ pub fn parse(allocator: Allocator, abc: *const Alphabet, data: []const u8) !Msa 
             } else if (std.mem.eql(u8, tag, "#=CS")) {
                 try cs_buf.appendSlice(allocator, annotation);
             } else if (std.mem.eql(u8, tag, "#=SS")) {
-                try ss_buf.appendSlice(allocator, annotation);
+                // #=SS annotates the most recently seen sequence.
+                // Silently ignore if no sequence has been seen yet.
+                if (last_seq_idx) |si| {
+                    // Lazily allocate per-sequence SS buffers.
+                    if (ss_bufs == null) {
+                        ss_bufs = .empty;
+                        // Pre-populate with empty buffers for all sequences seen so far.
+                        for (0..name_list.items.len) |_| {
+                            try ss_bufs.?.append(allocator, empty_buf);
+                        }
+                    }
+                    // Ensure there is a buffer for si (may have been added after init).
+                    while (ss_bufs.?.items.len <= si) {
+                        try ss_bufs.?.append(allocator, empty_buf);
+                    }
+                    try ss_bufs.?.items[si].appendSlice(allocator, annotation);
+                }
             } else if (std.mem.eql(u8, tag, "#=SA")) {
-                try sa_buf.appendSlice(allocator, annotation);
+                // #=SA annotates the most recently seen sequence.
+                // Silently ignore if no sequence has been seen yet.
+                if (last_seq_idx) |si| {
+                    // Lazily allocate per-sequence SA buffers.
+                    if (sa_bufs == null) {
+                        sa_bufs = .empty;
+                        for (0..name_list.items.len) |_| {
+                            try sa_bufs.?.append(allocator, empty_buf);
+                        }
+                    }
+                    while (sa_bufs.?.items.len <= si) {
+                        try sa_bufs.?.append(allocator, empty_buf);
+                    }
+                    try sa_bufs.?.items[si].appendSlice(allocator, annotation);
+                }
             }
             // Other comment lines are silently skipped
             continue;
@@ -82,6 +143,7 @@ pub fn parse(allocator: Allocator, abc: *const Alphabet, data: []const u8) !Msa 
                 const out: u8 = if (ch == ' ') '-' else ch;
                 try seq_bufs.items[idx].append(allocator, out);
             }
+            last_seq_idx = idx;
         } else {
             const name_copy = try allocator.dupe(u8, name);
             errdefer allocator.free(name_copy);
@@ -96,6 +158,21 @@ pub fn parse(allocator: Allocator, abc: *const Alphabet, data: []const u8) !Msa 
                 try buf.append(allocator, out);
             }
             try seq_bufs.append(allocator, buf);
+
+            // Extend ss_bufs / sa_bufs if they have already been allocated,
+            // so that buffer index always matches sequence index.
+            if (ss_bufs) |*b| {
+                while (b.items.len <= idx) {
+                    try b.append(allocator, empty_buf);
+                }
+            }
+            if (sa_bufs) |*b| {
+                while (b.items.len <= idx) {
+                    try b.append(allocator, empty_buf);
+                }
+            }
+
+            last_seq_idx = idx;
         }
     }
 
@@ -114,32 +191,30 @@ pub fn parse(allocator: Allocator, abc: *const Alphabet, data: []const u8) !Msa 
     for (name_list.items) |nm| allocator.free(nm);
     name_list.items.len = 0;
 
-    // Store parsed annotations
+    // Store parsed per-alignment annotations
     if (rf_buf.items.len > 0) {
         result.reference = try allocator.dupe(u8, rf_buf.items);
     }
-    if (ss_buf.items.len > 0) {
-        result.consensus_ss = try allocator.dupe(u8, ss_buf.items);
-    }
-
-    // Store CS and SA as GC markup entries
-    var gc_entries: std.ArrayList(GcEntry) = .empty;
-    defer gc_entries.deinit(allocator);
-
     if (cs_buf.items.len > 0) {
-        const cs_tag = try allocator.dupe(u8, "CS");
-        errdefer allocator.free(cs_tag);
-        const cs_ann = try allocator.dupe(u8, cs_buf.items);
-        try gc_entries.append(allocator, .{ .tag = cs_tag, .annotation = cs_ann });
+        result.consensus_ss = try allocator.dupe(u8, cs_buf.items);
     }
-    if (sa_buf.items.len > 0) {
-        const sa_tag = try allocator.dupe(u8, "SA");
-        errdefer allocator.free(sa_tag);
-        const sa_ann = try allocator.dupe(u8, sa_buf.items);
-        try gc_entries.append(allocator, .{ .tag = sa_tag, .annotation = sa_ann });
+
+    // Store per-sequence SS annotations
+    if (ss_bufs) |*b| {
+        for (b.items, 0..) |*ss, i| {
+            if (ss.items.len > 0) {
+                try result.setSeqSS(i, ss.items);
+            }
+        }
     }
-    if (gc_entries.items.len > 0) {
-        result.gc_markup = try gc_entries.toOwnedSlice(allocator);
+
+    // Store per-sequence SA annotations
+    if (sa_bufs) |*b| {
+        for (b.items, 0..) |*sa, i| {
+            if (sa.items.len > 0) {
+                try result.setSeqSA(i, sa.items);
+            }
+        }
     }
 
     return result;
@@ -232,10 +307,11 @@ test "parse: RF annotation stored" {
     try std.testing.expectEqualStrings("xx.x", rf);
 }
 
-test "parse: SS annotation stored in consensus_ss" {
+test "parse: SS annotation stored as per-sequence" {
     const allocator = std.testing.allocator;
     const abc = &@import("../alphabet.zig").dna;
 
+    // #=SS follows seq1, so it should be stored as seq1's per-sequence SS.
     const data =
         \\seq1  ACGT
         \\#=SS  <<>>
@@ -246,11 +322,126 @@ test "parse: SS annotation stored in consensus_ss" {
     defer msa.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), msa.nseq());
-    const ss = msa.consensus_ss orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("<<>>", ss);
+    // consensus_ss must NOT be set — #=SS is per-sequence, not consensus
+    try std.testing.expectEqual(@as(?[]const u8, null), msa.consensus_ss);
+    // seq1 (index 0) should have the SS annotation
+    const ss = msa.ss orelse return error.TestUnexpectedResult;
+    const seq1_ss = ss[0] orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("<<>>", seq1_ss);
+    // seq2 (index 1) has no SS
+    try std.testing.expectEqual(@as(?[]const u8, null), ss[1]);
 }
 
-test "parse: CS and SA stored as GC markup" {
+test "parse: CS annotation stored as consensus_ss" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("../alphabet.zig").dna;
+
+    const data =
+        \\seq1  ACGT
+        \\#=CS  <<>>
+        \\seq2  TGCA
+    ;
+
+    var msa = try parse(allocator, abc, data);
+    defer msa.deinit();
+
+    const cs = msa.consensus_ss orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("<<>>", cs);
+}
+
+test "parse: SA annotation stored as per-sequence" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("../alphabet.zig").dna;
+
+    // #=SA follows seq1, annotating it specifically.
+    const data =
+        \\seq1  ACGT
+        \\#=SA  1234
+        \\seq2  TGCA
+    ;
+
+    var msa = try parse(allocator, abc, data);
+    defer msa.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), msa.nseq());
+    // Should NOT appear in gc_markup
+    try std.testing.expectEqual(@as(?[]GcEntry, null), msa.gc_markup);
+    // seq1 (index 0) should have the SA annotation
+    const sa = msa.sa orelse return error.TestUnexpectedResult;
+    const seq1_sa = sa[0] orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("1234", seq1_sa);
+    // seq2 (index 1) has no SA
+    try std.testing.expectEqual(@as(?[]const u8, null), sa[1]);
+}
+
+test "parse: multi-sequence each with own SS" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("../alphabet.zig").dna;
+
+    // Each sequence has its own #=SS line immediately following it.
+    const data =
+        \\seq1  ACGT
+        \\#=SS  <<>>
+        \\seq2  TGCA
+        \\#=SS  ....
+        \\seq3  AAAA
+        \\#=SS  ::::
+    ;
+
+    var msa = try parse(allocator, abc, data);
+    defer msa.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), msa.nseq());
+    try std.testing.expectEqual(@as(?[]const u8, null), msa.consensus_ss);
+
+    const ss = msa.ss orelse return error.TestUnexpectedResult;
+    const ss0 = ss[0] orelse return error.TestUnexpectedResult;
+    const ss1 = ss[1] orelse return error.TestUnexpectedResult;
+    const ss2 = ss[2] orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("<<>>", ss0);
+    try std.testing.expectEqualStrings("....", ss1);
+    try std.testing.expectEqualStrings("::::", ss2);
+}
+
+test "parse: multi-block per-sequence SS accumulated" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("../alphabet.zig").dna;
+
+    // Two blocks; each block contributes SS annotations for seq1 only.
+    const data = "seq1  AC\n#=SS  <<\nseq2  TG\n\nseq1  GT\n#=SS  >>\nseq2  CA\n";
+
+    var msa = try parse(allocator, abc, data);
+    defer msa.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), msa.nseq());
+    try std.testing.expectEqual(@as(usize, 4), msa.alen);
+
+    const ss = msa.ss orelse return error.TestUnexpectedResult;
+    const ss0 = ss[0] orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("<<>>", ss0);
+    try std.testing.expectEqual(@as(?[]const u8, null), ss[1]);
+}
+
+test "parse: SS before any sequence is ignored" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("../alphabet.zig").dna;
+
+    // #=SS at the top, before any sequence line, should be silently ignored.
+    const data =
+        \\#=SS  ????
+        \\seq1  ACGT
+        \\seq2  TGCA
+    ;
+
+    var msa = try parse(allocator, abc, data);
+    defer msa.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), msa.nseq());
+    try std.testing.expectEqual(@as(?[]const u8, null), msa.consensus_ss);
+    try std.testing.expectEqual(@as(?[]?[]const u8, null), msa.ss);
+}
+
+test "parse: CS and SA stored correctly (CS=consensus, SA=per-seq)" {
     const allocator = std.testing.allocator;
     const abc = &@import("../alphabet.zig").dna;
 
@@ -264,12 +455,15 @@ test "parse: CS and SA stored as GC markup" {
     var msa = try parse(allocator, abc, data);
     defer msa.deinit();
 
-    const gc = msa.gc_markup orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(usize, 2), gc.len);
-    try std.testing.expectEqualStrings("CS", gc[0].tag);
-    try std.testing.expectEqualStrings("HHhh", gc[0].annotation);
-    try std.testing.expectEqualStrings("SA", gc[1].tag);
-    try std.testing.expectEqualStrings("1234", gc[1].annotation);
+    // #=CS → consensus_ss
+    const cs = msa.consensus_ss orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("HHhh", cs);
+
+    // #=SA → per-sequence SA for seq1 (index 0)
+    const sa = msa.sa orelse return error.TestUnexpectedResult;
+    const seq1_sa = sa[0] orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("1234", seq1_sa);
+    try std.testing.expectEqual(@as(?[]const u8, null), sa[1]);
 }
 
 test "parse: multi-block RF annotation accumulated" {
